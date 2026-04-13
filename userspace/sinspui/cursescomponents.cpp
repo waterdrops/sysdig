@@ -33,17 +33,17 @@ limitations under the License.
 #include <set>
 using namespace std;
 
-#include "sinsp.h"
-#include "sinsp_int.h"
-#include "filter.h"
-#include "filterchecks.h"
+#include <libsinsp/sinsp.h>
+#include <libsinsp/sinsp_int.h>
+#include <libsinsp/filter.h>
+#include <libsinsp/filterchecks.h>
+#include <libsinsp/utils.h>
 
-#include "table.h"
+#include <chisel/chisel_table.h>
+#include <chisel/chisel_viewinfo.h>
 #include "cursescomponents.h"
 #include "cursestable.h"
-#include "viewinfo.h"
 #include "cursesui.h"
-#include "utils.h"
 
 extern bool g_filterchecks_force_raw_times;
 
@@ -51,6 +51,7 @@ extern bool g_filterchecks_force_raw_times;
 // spy_text_renderer implementation
 ///////////////////////////////////////////////////////////////////////////////
 spy_text_renderer::spy_text_renderer(sinsp* inspector, 
+	std::shared_ptr<sinsp_filter_check_list> filter_check_list,
 	sinsp_cursesui* parent,
 	int32_t viz_type, 
 	sysdig_output_type sotype, 
@@ -59,9 +60,9 @@ spy_text_renderer::spy_text_renderer(sinsp* inspector,
 {
 	m_formatter = NULL;
 	m_inspector = inspector;
+	m_filter_check_list = filter_check_list;
 	m_viz_type = viz_type;
 	m_linecnt = 0;
-	g_filterchecks_force_raw_times = false;
 
 	//
 	// visualization-type inits
@@ -73,25 +74,14 @@ spy_text_renderer::spy_text_renderer(sinsp* inspector,
 			if(print_containers)
 			{
 				m_formatter = new sinsp_evt_formatter(m_inspector,
-					"*(latency=%evt.latency.human) (fd=%fd.name) %evt.num %evt.time %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info");
+					"*(latency=%evt.latency.human) (fd=%fd.name) %evt.num %evt.time %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info",
+					*m_filter_check_list);
 			}
 			else
 			{
 				m_formatter = new sinsp_evt_formatter(m_inspector,
-					"*(latency=%evt.latency.human) (fd=%fd.name) %evt.num %evt.time %evt.cpu %proc.name %thread.tid %evt.dir %evt.type %evt.info");
-			}
-		}
-		else if(sotype == spy_text_renderer::OT_LATENCY_APP)
-		{
-			if(print_containers)
-			{
-				m_formatter = new sinsp_evt_formatter(m_inspector,
-					"*(latency=%tracer.latency.human) %evt.num %evt.time %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info");
-			}
-			else
-			{
-				m_formatter = new sinsp_evt_formatter(m_inspector,
-					"*(latency=%tracer.latency.human) %evt.num %evt.time %evt.cpu %proc.name %thread.tid %evt.dir %evt.type %evt.info");
+					"*(latency=%evt.latency.human) (fd=%fd.name) %evt.num %evt.time %evt.cpu %proc.name %thread.tid %evt.dir %evt.type %evt.info",
+					*m_filter_check_list);
 			}
 		}
 		else
@@ -99,11 +89,12 @@ spy_text_renderer::spy_text_renderer(sinsp* inspector,
 			if(print_containers)
 			{
 				m_formatter = new sinsp_evt_formatter(m_inspector,
-					"*%evt.num %evt.time %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info");
+					"*%evt.num %evt.time %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info",
+					*m_filter_check_list);
 			}
 			else
 			{
-				m_formatter = new sinsp_evt_formatter(m_inspector, DEFAULT_OUTPUT_STR);
+				m_formatter = new sinsp_evt_formatter(m_inspector, DEFAULT_OUTPUT_STR, *m_filter_check_list);
 			}
 		}
 	}
@@ -138,9 +129,14 @@ const char* spy_text_renderer::process_event_spy(sinsp_evt* evt, int64_t* len)
 	//
 	// Get and validate the length
 	//
-	sinsp_evt_param* parinfo = evt->get_param(0);
+	const sinsp_evt_param* parinfo;
+    try {
+        parinfo = evt->get_param(0);
+    } catch (...) {
+        return NULL;
+    }
 	ASSERT(parinfo->m_len == sizeof(int64_t));
-	*len = *(int64_t*)parinfo->m_val;
+	*len = *(int64_t*)parinfo->data();
 	if(*len <= 0)
 	{
 		return NULL;
@@ -155,7 +151,7 @@ const char* spy_text_renderer::process_event_spy(sinsp_evt* evt, int64_t* len)
 		return NULL;
 	}
 
-	sinsp_fdinfo_t* m_fdinfo = evt->get_fd_info();
+	sinsp_fdinfo* m_fdinfo = evt->get_fd_info();
 	if(m_fdinfo == NULL)
 	{
 		return NULL;
@@ -390,7 +386,7 @@ void curses_table_sidemenu::render()
 	//
 	// Render the rows
 	//
-	for(j = m_firstrow; j < MIN(m_firstrow + (int32_t)m_h - 1, (int32_t)m_entries.size()); j++)
+	for(j = m_firstrow; j < std::min(m_firstrow + (int32_t)m_h - 1, (int32_t)m_entries.size()); j++)
 	{
 		if(j == m_selct)
 		{
@@ -452,7 +448,7 @@ void curses_table_sidemenu::update_view_info()
 //
 // Return true if the parent should handle the event
 //
-sysdig_table_action curses_table_sidemenu::handle_input(int ch)
+chisel_table_action curses_table_sidemenu::handle_input(int ch)
 {
 	int32_t prev_select;
 	int input;
@@ -742,7 +738,7 @@ sysdig_table_action curses_table_sidemenu::handle_input(int ch)
 ///////////////////////////////////////////////////////////////////////////////
 // curses_textbox implementation
 ///////////////////////////////////////////////////////////////////////////////
-curses_textbox::curses_textbox(sinsp* inspector, sinsp_cursesui* parent, int32_t viz_type, spy_text_renderer::sysdig_output_type sotype)
+curses_textbox::curses_textbox(sinsp* inspector, std::shared_ptr<sinsp_filter_check_list> filter_check_list, sinsp_cursesui* parent, int32_t viz_type, spy_text_renderer::sysdig_output_type sotype)
 {
 	ASSERT(inspector != NULL);
 	ASSERT(parent != NULL);
@@ -753,6 +749,7 @@ curses_textbox::curses_textbox(sinsp* inspector, sinsp_cursesui* parent, int32_t
 	m_filter = NULL;
 	m_text_renderer = NULL;
 	m_inspector = inspector;
+	m_filter_check_list = filter_check_list;
 	n_prints = 0;
 	m_paused = false;
 	m_sidemenu = NULL;
@@ -771,8 +768,9 @@ curses_textbox::curses_textbox(sinsp* inspector, sinsp_cursesui* parent, int32_t
 	config.m_scroll_on_append = true;
 	config.m_bounding_box = true;
 
-	m_text_renderer = new spy_text_renderer(inspector, 
-		parent, 
+	m_text_renderer = new spy_text_renderer(inspector,
+		m_filter_check_list,
+		parent,
 		viz_type, 
 		sotype, 
 		m_parent->m_print_containers,
@@ -840,11 +838,6 @@ curses_textbox::~curses_textbox()
 		delete m_searcher;
 	}
 
-	if(m_filter != NULL)
-	{
-		delete m_filter;
-	}
-
 	if(m_text_renderer)
 	{
 		delete m_text_renderer;
@@ -864,8 +857,12 @@ curses_textbox::~curses_textbox()
 
 void curses_textbox::set_filter(string filter)
 {
-	sinsp_filter_compiler compiler(m_inspector, filter);
-	m_filter = compiler.compile();
+	if(filter != "")
+	{
+		auto filter_factory = std::make_shared<sinsp_filter_factory>(m_inspector, *m_filter_check_list);
+		sinsp_filter_compiler compiler(filter_factory, filter);
+		m_filter = compiler.compile();
+	}
 }
 
 void curses_textbox::print_no_data()
@@ -875,7 +872,7 @@ void curses_textbox::print_no_data()
 	string wstr = "No Data For This Selection";
 	mvprintw(m_parent->m_screenh / 2,
 		m_parent->m_screenw / 2 - wstr.size() / 2,
-		wstr.c_str());
+		"%s", wstr.c_str());
 
 	refresh();
 }
@@ -935,7 +932,20 @@ void curses_textbox::process_event_spy(sinsp_evt* evt, int32_t next_res)
 	{
 		wattrset(m_win, m_parent->m_colors[sinsp_cursesui::LED_COLOR]);
 
-		m_ctext->printf(" [%s]", m_inspector->m_container_manager.get_container_name(m_tinfo).c_str());
+		const auto ctable = m_inspector->m_thread_manager
+			->get_table(sinsp_thread_manager::s_containers_table_name);
+
+		std::string container_name = "host";
+		if(!m_tinfo->get_container_id().empty())
+		{
+			if(ctable != nullptr) {
+				auto fld_name = ctable->get_field<std::string>("name");
+
+				auto container_info = ctable->get_entry(m_tinfo->get_container_id());
+				container_info.read_field(fld_name, container_name);
+			}
+		}
+		m_ctext->printf(" [%s]", container_name.c_str());
 
 		if(eflags & EF_READS_FROM_FD)
 		{
@@ -1098,7 +1108,7 @@ void curses_textbox::render()
 		attrset(m_parent->m_colors[sinsp_cursesui::LARGE_NUMBER]);
 		mvprintw(0,
 			m_parent->m_screenw / 2 - wstr.size() / 2,
-			wstr.c_str());
+			"%s", wstr.c_str());
 	}
 
 	//
@@ -1113,11 +1123,11 @@ void curses_textbox::render()
 //
 // Return true if the parent should handle the event
 //
-sysdig_table_action curses_textbox::handle_input(int ch)
+chisel_table_action curses_textbox::handle_input(int ch)
 {
 	if(m_sidemenu)
 	{
-		sysdig_table_action ta = m_sidemenu->handle_input(ch);
+		chisel_table_action ta = m_sidemenu->handle_input(ch);
 		if(ta == STA_SWITCH_VIEW)
 		{
 			switch(m_parent->m_selected_view_sidemenu_entry)
@@ -1310,10 +1320,10 @@ void curses_textbox::reset()
 	n_prints = 0;
 }
 
-bool curses_textbox::get_position(OUT int32_t* pos,
-	OUT int32_t* totlines,
-	OUT float* percent,
-	OUT bool* truncated)
+bool curses_textbox::get_position(int32_t* pos,
+	int32_t* totlines,
+	float* percent,
+	bool* truncated)
 {
 	int32_t ox;
 
@@ -1422,7 +1432,7 @@ curses_viewinfo_page::curses_viewinfo_page(sinsp_cursesui* parent,
 	ctext_config config;
 	int input;
 
-	sinsp_view_info* vinfo = parent->m_views.at(viewnum);
+	chisel_view_info* vinfo = parent->m_views.at(viewnum);
 
 	m_win = newwin(h, w, starty, startx);
 
@@ -1483,7 +1493,7 @@ curses_viewinfo_page::curses_viewinfo_page(sinsp_cursesui* parent,
 
 	uint32_t j;
 
-	if(vinfo->get_type() == sinsp_view_info::T_TABLE)
+	if(vinfo->get_type() == chisel_view_info::T_TABLE)
 	{
 		j = vinfo->does_groupby()? 2 : 1;
 	}
@@ -1586,7 +1596,7 @@ void curses_viewinfo_page::render()
 	m_ctext->redraw();
 }
 
-sysdig_table_action curses_viewinfo_page::handle_input(int ch)
+chisel_table_action curses_viewinfo_page::handle_input(int ch)
 {
 	int32_t totlines;
 
@@ -1935,7 +1945,7 @@ void curses_mainhelp_page::render()
 	m_ctext->redraw();
 }
 
-sysdig_table_action curses_mainhelp_page::handle_input(int ch)
+chisel_table_action curses_mainhelp_page::handle_input(int ch)
 {
 	int32_t totlines;
 

@@ -1,0 +1,253 @@
+name: Create Sysdig draft/RC release
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-[a-z]+'
+      - '[0-9]+.[0-9]+.[0-9]+-[a-z]+[0-9]+'
+
+env:
+  BUILD_VERSION: ${{ github.ref_name }}
+
+jobs:
+  build-release-linux:
+    runs-on: ubuntu-24.04${{ matrix.platform == 'arm64' && '-arm' || '' }}
+    container:
+      image: ubuntu:24.04
+    strategy:
+      matrix:
+        platform:
+          - amd64
+          - arm64
+        include:
+        - platform: amd64
+          base_arch: x86_64
+          release_arch: x86_64
+        - platform: arm64
+          base_arch: aarch64
+          release_arch: aarch64
+
+    env:
+      ZIG_VERSION: 0.14.1
+
+    steps:
+      - name: Checkout Sysdig
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          cp -v scripts/zig-cc  /usr/bin/
+          cp -v scripts/zig-c++ /usr/bin/
+          apt update && \
+          apt install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            git \
+            libelf-dev \
+            libtool \
+            linux-tools-$(uname -r) \
+            llvm \
+            ninja-build \
+            pkg-config \
+            rpm \
+            wget \
+            xz-utils && \
+          git clone https://github.com/libbpf/bpftool.git --branch v7.3.0 --single-branch && \
+          cd bpftool && \
+          git submodule update --init && \
+          cd src && \
+          make install && \
+          cd ../.. && \
+          rm -fr bpftool && \
+          curl -LO "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+          tar -xaf "zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+          rm -v  "zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+          cd zig-* &&  \
+          cp -v zig /usr/bin && \
+          find lib -exec cp --parents {} /usr/ \; && \
+          cd .. && \
+          rm -fr zig*
+
+
+      - name: Build Sysdig
+        env:
+          CC: zig-cc
+          CXX: zig-c++
+          AR: zig ar
+          RANLIB: zig ranlib
+        run: |
+          cmake \
+            -DUSE_BUNDLED_DEPS=ON \
+            -DBUILD_BPF=OFF \
+            -DBUILD_DRIVER=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="/usr" \
+            -DSYSDIG_VERSION="${{ env.BUILD_VERSION }}" \
+            -Wno-dev \
+            -S . \
+            -B build \
+            -G Ninja
+          cmake --build build --target package --config Release
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysdig-release-${{ env.BUILD_VERSION }}-linux-${{ matrix.release_arch }}
+          path: |
+            build/sysdig-${{ env.BUILD_VERSION }}*
+
+  build-release-others:
+    name: build-release-others
+    strategy:
+      matrix:
+        os: [windows-latest, macos-15-intel, macos-14]
+        include:
+          - os: windows-latest
+            artifact_name: win
+            artifact_ext: exe
+            arch: x86_64
+          - os: macos-15-intel
+            artifact_name: osx
+            artifact_ext: dmg
+            arch: x86_64
+          - os: macos-14
+            artifact_name: osx
+            artifact_ext: dmg
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Sysdig
+        uses: actions/checkout@v4
+      - name: Install NSIS
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install nsis -y
+      - name: Build
+        run: |
+          cmake -Wno-dev -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_DRIVER=OFF -DSYSDIG_VERSION="${{ env.BUILD_VERSION }}" -S . -B build
+          cmake --build build --target package --config Release
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysdig-release-${{ env.BUILD_VERSION }}-${{ matrix.artifact_name }}-${{ matrix.arch }}
+          path: build/sysdig-${{ env.BUILD_VERSION }}*.${{ matrix.artifact_ext }}
+
+  push-container-image:
+    runs-on: ubuntu-24.04${{ matrix.platform == 'arm64' && '-arm' || '' }}
+    strategy:
+      matrix:
+        platform:
+          - amd64
+          - arm64
+        include:
+        - platform: amd64
+          base_arch: x86_64
+          release_arch: x86_64
+        - platform: arm64
+          base_arch: aarch64
+          release_arch: aarch64
+    needs: [build-release-linux,  sign-linux-packages]
+    env:
+      REGISTRY: ghcr.io
+      SYSDIG_IMAGE_BASE: ghcr.io/draios/sysdig
+    steps:
+      - name: Checkout Sysdig
+        uses: actions/checkout@v4
+
+      - name: Download artifacts aarch64
+        uses: actions/download-artifact@v4
+        with:
+          name: sysdig-release-${{ env.BUILD_VERSION }}-linux-aarch64
+
+      - name: Download artifacts x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: sysdig-release-${{ env.BUILD_VERSION }}-linux-x86_64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Github Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push container images
+        uses: docker/build-push-action@v6
+        with:
+          file: docker/sysdig/Dockerfile
+          context: .
+          tags: ${{ env.SYSDIG_IMAGE_BASE }}:${{ env.BUILD_VERSION }}-${{ matrix.platform }}-draft
+          push: true
+          provenance: false
+          build-args:
+            BUILD_VERSION=${{ env.BUILD_VERSION }}
+
+  sign-linux-packages:
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:24.04
+    strategy:
+      matrix:
+        name: [amd64, arm64]
+        include:
+          - name: amd64
+            arch: x86_64
+          - name: arm64
+            arch: aarch64
+    needs: build-release-linux
+    env:
+      KEY_ID: EC51E8C4
+    steps:
+      - name: Install deps
+        run: apt update && apt -y install debsigs gpg rpm gnupg2
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sysdig-release-${{ env.BUILD_VERSION }}-linux-${{ matrix.arch }}
+
+      - name: Import private key
+        env:
+          PRIVATE_KEY: ${{ secrets.SYSDIG_REPO_SIGNING_KEY }}
+        run: printenv PRIVATE_KEY | gpg --import -
+
+      - name: Sign DEBs
+        run: debsigs --sign=origin --default-key="${{ env.KEY_ID }}" *.deb
+
+      - name: Sign RPMs
+        run: rpm --define "_gpg_name ${{ env.KEY_ID }}" --define "_binary_filedigest_algorithm 8" --addsign *.rpm
+
+      - name: Upload Signed Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysdig-release-${{ env.BUILD_VERSION }}-linux-${{ matrix.arch }}
+          overwrite: true
+          path: |
+            *.deb
+            *.rpm
+            *.tar.gz
+
+  create-draft-release:
+    runs-on: ubuntu-latest
+    needs: [push-container-image, build-release-linux, sign-linux-packages, build-release-others]
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sysdig-release-${{ env.BUILD_VERSION }}*
+          merge-multiple: true
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sysdig-${{ env.BUILD_VERSION }}*
+          draft: true

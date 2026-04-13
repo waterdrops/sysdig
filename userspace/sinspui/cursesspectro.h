@@ -47,7 +47,7 @@ public:
 	}
 
 	uint64_t m_ts;
-	vector<uint32_t> m_data;
+	std::vector<uint32_t> m_data;
 };
 
 class curses_spectro : 
@@ -60,13 +60,13 @@ public:
 		ALIGN_RIGHT,
 	};
 
-	curses_spectro(sinsp_cursesui* parent, sinsp* inspector, bool is_tracer);
+	curses_spectro(sinsp_cursesui* parent, sinsp* inspector);
 	~curses_spectro();
 
-	void configure(sinsp_table* table);
-	void update_data(vector<sinsp_sample_row>* data, bool force_selection_change = false);
+	void configure(chisel_table* table);
+	void update_data(std::vector<chisel_sample_row>* data, bool force_selection_change = false);
 	void render(bool data_changed);
-	sysdig_table_action handle_input(int ch);
+	chisel_table_action handle_input(int ch);
 	void set_x_start(uint32_t x)
 	{
 		m_table_x_start = x;
@@ -83,20 +83,20 @@ public:
 			return 0;
 		}
 	}
-	bool get_position(OUT int32_t* pos,	OUT int32_t* totlines, OUT float* percent, OUT bool* truncated)
+	bool get_position(int32_t* pos,	int32_t* totlines, float* percent, bool* truncated)
 	{
 		return false;
 	}
 
-	sinsp_table_field_storage m_last_key;
+	chisel_table_field_storage m_last_key;
 	bool m_drilled_up;
 	bool m_selection_changed;
 	MEVENT m_last_mevent;
-	string m_selection_filter;
+	std::string m_selection_filter;
 	bool m_scroll_paused;
 	
 private:
-	void print_error(string wstr);
+	void print_error(std::string wstr);
 	uint32_t mkcol(uint64_t n);
 	void draw_axis();
 	void draw_menu(bool there_is_more);
@@ -109,25 +109,24 @@ private:
 	sinsp* m_inspector;
 	WINDOW* m_tblwin;
 	sinsp_cursesui* m_parent;
-	sinsp_table* m_table;
+	chisel_table* m_table;
 	int32_t m_table_x_start;
 	uint32_t m_table_y_start;
-	vector<curses_table_column_info> m_legend;
-	vector<sinsp_sample_row>* m_data;
+	std::vector<curses_table_column_info> m_legend;
+	std::vector<chisel_sample_row>* m_data;
 	uint32_t m_w;
 	uint32_t m_h;
-	vector<uint32_t> m_colpalette;
+	std::vector<uint32_t> m_colpalette;
 	sinsp_filter_check_reference* m_converter;
 	uint64_t m_n_flushes;
 	uint64_t m_n_flushes_with_data;
-	vector<curses_spectro_history_row> m_history;
+	std::vector<curses_spectro_history_row> m_history;
 	curses_spectro_history_row m_t_row;
 	bool m_mouse_masked;
 	int32_t m_lastx, m_lasty;
 	int32_t m_selstart_x, m_selstart_y;
 	int32_t m_prev_sel_x1, m_prev_sel_x2;
 	int32_t m_prev_sel_y1, m_prev_sel_y2;
-	bool m_is_tracer;
 	bool m_selecting;
 
 	friend class curses_spectro_sidemenu;

@@ -12,15 +12,15 @@ elseif(NOT USE_BUNDLED_NCURSES)
 else()
 	set(CURSES_BUNDLE_DIR "${PROJECT_BINARY_DIR}/ncurses-prefix/src/ncurses")
 	set(CURSES_INCLUDE_DIR "${CURSES_BUNDLE_DIR}/include/")
-	set(CURSES_LIBRARIES "${CURSES_BUNDLE_DIR}/lib/libncurses.a")
+	set(CURSES_LIBRARIES "${CURSES_BUNDLE_DIR}/lib/libncursesw.a")
 
 	if(NOT TARGET ncurses)
 		message(STATUS "Using bundled ncurses in '${CURSES_BUNDLE_DIR}'")
 
 		ExternalProject_Add(ncurses
 			PREFIX "${PROJECT_BINARY_DIR}/ncurses-prefix"
-			URL "http://download.draios.com/dependencies/ncurses-6.0-20150725.tgz"
-			URL_MD5 "32b8913312e738d707ae68da439ca1f4"
+			URL "https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz"
+			URL_MD5 "ac2d2629296f04c8537ca706b6977687"
 			CONFIGURE_COMMAND ./configure --without-cxx --without-cxx-binding --without-ada --without-manpages --without-progs --without-tests --with-terminfo-dirs=/etc/terminfo:/lib/terminfo:/usr/share/terminfo
 			BUILD_COMMAND ${CMD_MAKE}
 			BUILD_IN_SOURCE 1

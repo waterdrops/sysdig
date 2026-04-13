@@ -1,0 +1,2 @@
+#!/bin/bash
+exec zig cc -target $(uname -m)-linux-gnu.2.17 -mcpu=baseline $@

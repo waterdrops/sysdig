@@ -1,0 +1,143 @@
+name: CI Build
+on: 
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+
+jobs:
+  build-sysdig-linux:
+    runs-on: ubuntu-24.04${{ matrix.platform == 'arm64' && '-arm' || '' }}
+    container:
+      image: ubuntu:24.04
+    strategy:
+      matrix:
+        platform:
+          - amd64
+          - arm64
+    env:
+      ZIG_VERSION: 0.14.1
+
+    steps:
+      - name: Checkout Sysdig
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          cp -v scripts/zig-cc  /usr/bin/
+          cp -v scripts/zig-c++ /usr/bin/
+          apt update && \
+          apt install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            git \
+            libelf-dev \
+            libtool \
+            linux-tools-$(uname -r) \
+            llvm \
+            ninja-build \
+            pkg-config \
+            rpm \
+            wget \
+            xz-utils && \
+          git clone https://github.com/libbpf/bpftool.git --branch v7.3.0 --single-branch && \
+          cd bpftool && \
+          git submodule update --init && \
+          cd src && \
+          make install && \
+          cd ../.. && \
+          rm -fr bpftool && \
+          curl -LO "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+          tar -xaf "zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+          rm -v  "zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" && \
+          cd zig-* &&  \
+          cp -v zig /usr/bin && \
+          find lib -exec cp --parents {} /usr/ \; && \
+          cd .. && \
+          rm -fr zig*
+
+      - name: Build Sysdig
+        env:
+          CC: zig-cc
+          CXX: zig-c++
+          AR: zig ar
+          RANLIB: zig ranlib
+        run: |
+          cmake \
+            -DUSE_BUNDLED_DEPS=ON \
+            -DBUILD_BPF=OFF \
+            -DBUILD_DRIVER=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -S . \
+            -B build \
+            -G Ninja
+          cmake --build build --target package --config Release
+
+      - name: Set artifact name
+        id: artifact_name
+        run: |
+          echo "name=sysdig-dev-linux-$(echo ${{ matrix.platform }} | sed -e 's|/|-|g')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload rpm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_name.outputs.name }}.rpm
+          path: |
+            build/sysdig-*.rpm
+
+      - name: Upload deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_name.outputs.name }}.deb
+          path: |
+            build/sysdig-*.deb
+
+      - name: Upload tar.gz package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_name.outputs.name }}.tar.gz
+          path: |
+            build/sysdig-*.tar.gz
+
+  build-sysdig-others:
+    name: build-sysdig-${{ matrix.os }}-${{ matrix.arch }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-15-intel, macos-14]
+        include:
+          - os: windows-latest
+            artifact_name: win
+            artifact_ext: exe
+            arch: x86_64
+          - os: macos-15-intel
+            artifact_name: osx
+            artifact_ext: dmg
+            arch: x86_64
+          - os: macos-14
+            artifact_name: osx
+            artifact_ext: dmg
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Sysdig
+        uses: actions/checkout@v4
+      - name: Install NSIS
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install nsis -y
+      - name: Build
+        run: |
+          cmake -Wno-dev -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -S . -B build
+          cmake --build build --target package --config Release
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysdig-dev-${{ matrix.artifact_name }}-${{ matrix.arch }}
+          path: build/sysdig-*.${{ matrix.artifact_ext }}

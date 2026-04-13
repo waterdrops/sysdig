@@ -32,15 +32,15 @@ limitations under the License.
 #include <set>
 using namespace std;
 
-#include "sinsp.h"
-#include "sinsp_int.h"
-#include "filter.h"
-#include "filterchecks.h"
+#include <libsinsp/sinsp.h>
+#include <libsinsp/sinsp_int.h>
+#include <libsinsp/filter.h>
+#include <libsinsp/filterchecks.h>
 
 #ifndef NOCURSESUI
 
 #include <curses.h>
-#include "table.h"
+#include <chisel/chisel_table.h>
 #include "cursescomponents.h"
 #include "cursestable.h"
 #include "cursesui.h"
@@ -48,7 +48,7 @@ using namespace std;
 ///////////////////////////////////////////////////////////////////////////////
 // curses_table implementation
 ///////////////////////////////////////////////////////////////////////////////
-curses_table::curses_table(sinsp_cursesui* parent, sinsp* inspector, sinsp_table::tabletype type)
+curses_table::curses_table(sinsp_cursesui* parent, sinsp* inspector, chisel_table::tabletype type)
 {
 	m_tblwin = NULL;
 	m_data = NULL;
@@ -129,7 +129,7 @@ curses_table::~curses_table()
 	delete m_converter;
 }
 
-void curses_table::configure(sinsp_table* table, 
+void curses_table::configure(chisel_table* table, 
 	vector<int32_t>* colsizes, vector<string>* colnames)
 {
 	uint32_t j;
@@ -197,7 +197,7 @@ void curses_table::configure(sinsp_table* table,
 
 void curses_table::update_rowkey(int32_t row)
 {
-	sinsp_table_field* rowkey = m_table->get_row_key(row);
+	chisel_table_field* rowkey = m_table->get_row_key(row);
 
 	if(rowkey != NULL)
 	{
@@ -210,7 +210,7 @@ void curses_table::update_rowkey(int32_t row)
 	}
 }
 
-void curses_table::update_data(vector<sinsp_sample_row>* data, bool force_selection_change)
+void curses_table::update_data(vector<chisel_sample_row>* data, bool force_selection_change)
 {
 	m_data = data;
 
@@ -252,7 +252,7 @@ void curses_table::print_line_centered(string line, int32_t off)
 		mvwprintw(m_tblwin, 
 			m_parent->m_screenh / 2 + off,
 			m_parent->m_screenw / 2 - line.size() / 2, 
-			line.c_str());
+			"%s", line.c_str());
 	}
 	else
 	{
@@ -261,12 +261,12 @@ void curses_table::print_line_centered(string line, int32_t off)
 		for(uint32_t j = 0;; j++)
 		{
 			string ss = line.substr(spos, spos + m_parent->m_screenw);
-glogf("2, %d %s\n", spos, ss.c_str());
+			libsinsp_logger()->format("2, %d %s\n", spos, ss.c_str());
 
 			mvwprintw(m_tblwin, 
 				m_parent->m_screenh / 2 + off + j,
 				0,
-				ss.c_str());
+				"%s", ss.c_str());
 
 			spos += m_parent->m_screenw;
 			if(spos >= line.size())
@@ -280,43 +280,26 @@ glogf("2, %d %s\n", spos, ss.c_str());
 void curses_table::print_wait()
 {
 	string wstr;
-	bool is_tracer_view = false;
 
-	sinsp_view_info* vinfo = m_parent->get_selected_view();
-	if(vinfo)
-	{
-		if(vinfo->m_id == "tracers" ||
-			vinfo->m_id == "tracer_ids")
-		{
-			is_tracer_view = true;
-		}
-	}
-	else
+	chisel_view_info* vinfo = m_parent->get_selected_view();
+	if(!vinfo)
 	{
 		ASSERT(false);
 	}
 
-	if(is_tracer_view)
+	if(m_inspector->is_live())
 	{
-		print_line_centered("No data for this view.");
-		print_line_centered("Note: in order to see any data here, you need to push tracers to sysdig from your app as described here: XXX.", 2);
+		wstr = "Collecting Data";
 	}
 	else
 	{
-		if(m_inspector->is_live())
+		if(m_parent->is_eof())
 		{
-			wstr = "Collecting Data";
+			wstr = "No Data For This View";
 		}
-		else
-		{
-			if(m_parent->is_eof())
-			{
-				wstr = "No Data For This View";
-			}
-		}
-	
-		print_line_centered(wstr);
 	}
+	
+	print_line_centered(wstr);
 }
 
 void curses_table::print_error(string wstr)
@@ -325,8 +308,8 @@ void curses_table::print_error(string wstr)
 
 	mvwprintw(m_tblwin, 
 		m_parent->m_screenh / 2,
-		m_parent->m_screenw / 2 - wstr.size() / 2, 
-		wstr.c_str());	
+		m_parent->m_screenw / 2 - wstr.size() / 2,
+		"%s", wstr.c_str());
 }
 
 void curses_table::render(bool data_changed)
@@ -375,7 +358,7 @@ void curses_table::render(bool data_changed)
 
 		for(j = 0; j < m_w; j++)
 		{
-			if(m_type == sinsp_table::TT_TABLE)
+			if(m_type == chisel_table::TT_TABLE)
 			{
 				wattrset(m_tblwin, m_parent->m_colors[sinsp_cursesui::PANEL_HEADER_FOCUS]);
 			}
@@ -391,7 +374,7 @@ void curses_table::render(bool data_changed)
 		{
 			if(j == m_table->get_sorting_col() - 1)
 			{
-				if(m_type == sinsp_table::TT_TABLE)
+				if(m_type == chisel_table::TT_TABLE)
 				{
 					wattrset(m_tblwin, m_parent->m_colors[sinsp_cursesui::PANEL_HIGHLIGHT_FOCUS]);
 				}
@@ -402,7 +385,7 @@ void curses_table::render(bool data_changed)
 			}
 			else
 			{
-				if(m_type == sinsp_table::TT_TABLE)
+				if(m_type == chisel_table::TT_TABLE)
 				{
 					wattrset(m_tblwin, m_parent->m_colors[sinsp_cursesui::PANEL_HEADER_FOCUS]);
 				}
@@ -453,9 +436,9 @@ void curses_table::render(bool data_changed)
 		//
 		// Render the rows
 		//
-		vector<sinsp_table_field>* row;
+		vector<chisel_table_field>* row;
 
-		for(l = 0; l < (int32_t)MIN(m_data->size(), m_h - 1); l++)
+		for(l = 0; l < std::min((int32_t)m_data->size(),(int32_t)(m_h - 1)); l++)
 		{
 			if(l + m_firstrow >= (int32_t)m_data->size())
 			{
@@ -487,7 +470,7 @@ void curses_table::render(bool data_changed)
 
 			for(j = 0, k = 0; j < m_legend.size(); j++)
 			{
-				sinsp_filter_check* extractor = m_table->m_extractors->at(j + 1);
+				auto extractor = m_table->m_extractors->at(j + 1);
 				uint64_t td = 0;
 
 				if(extractor->m_aggregation == A_TIME_AVG || 
@@ -497,6 +480,7 @@ void curses_table::render(bool data_changed)
 				}
 
 				m_converter->set_val(m_legend[j].m_info.m_type, 
+					EPF_NONE,
 					row->at(j).m_val, 
 					row->at(j).m_len,
 					row->at(j).m_cnt,
@@ -570,7 +554,7 @@ render_end:
 string curses_table::get_field_val(string fldname)
 {
 	uint32_t j;
-	vector<sinsp_table_field>* row;
+	vector<chisel_table_field>* row;
 	string res;
 
 	row = &(m_data->at(m_selct).m_values);
@@ -594,6 +578,7 @@ string curses_table::get_field_val(string fldname)
 		{
 			uint32_t k = j - 1;
 			m_converter->set_val(m_legend[k].m_info.m_type, 
+				EPF_NONE,
 				row->at(k).m_val, 
 				row->at(k).m_len,
 				row->at(k).m_cnt,
@@ -616,7 +601,7 @@ string curses_table::get_field_val(string fldname)
 //
 // Return false if the user wants us to exit
 //
-sysdig_table_action curses_table::handle_input(int ch)
+chisel_table_action curses_table::handle_input(int ch)
 {
 	if(m_data == NULL)
 	{
@@ -772,7 +757,7 @@ sysdig_table_action curses_table::handle_input(int ch)
 			break;
 		case 'c':
 		case KEY_DC:
-			if(m_type == sinsp_table::TT_LIST)
+			if(m_type == chisel_table::TT_LIST)
 			{
 				m_table->clear();
 				render(true);
@@ -787,7 +772,7 @@ sysdig_table_action curses_table::handle_input(int ch)
 	// Check if this view has any action configured, and if yes find if this key
 	// is one of the view hotkeys
 	//
-	sinsp_view_info* vinfo = m_parent->get_selected_view();
+	chisel_view_info* vinfo = m_parent->get_selected_view();
 
 	for(auto hk : vinfo->m_actions)
 	{
@@ -859,10 +844,10 @@ void curses_table::goto_row(int32_t row)
 	render(true);
 }
 
-bool curses_table::get_position(OUT int32_t* pos, 
-	OUT int32_t* totlines, 
-	OUT float* percent, 
-	OUT bool* truncated)
+bool curses_table::get_position(int32_t* pos, 
+	int32_t* totlines, 
+	float* percent, 
+	bool* truncated)
 {
 	if(m_data == NULL || m_data->size() == 0)
 	{

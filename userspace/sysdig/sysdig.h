@@ -33,6 +33,11 @@ limitations under the License.
 //
 #define CHISELS_INSTALLATION_DIR "/share/sysdig/chisels"
 
+//
+// Relative path to plugins
+//
+#define PLUGINS_INSTALLATION_DIR "/share/sysdig/plugins"
+
 #include <config_sysdig.h>
 
 //
@@ -62,7 +67,7 @@ public:
 	}
 
 	int m_res;
-	vector<string> m_next_run_args;
+	std::vector<std::string> m_next_run_args;
 };
 
 //

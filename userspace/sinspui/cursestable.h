@@ -30,14 +30,14 @@ public:
 		ALIGN_RIGHT,
 	};
 
-	curses_table(sinsp_cursesui* parent, sinsp* inspector, sinsp_table::tabletype type);
+	curses_table(sinsp_cursesui* parent, sinsp* inspector, chisel_table::tabletype type);
 	~curses_table();
 
-	void configure(sinsp_table* table, 
-		vector<int32_t>* colsizes, vector<string>* colnames);
-	void update_data(vector<sinsp_sample_row>* data, bool force_selection_change = false);
+	void configure(chisel_table* table, 
+		std::vector<int32_t>* colsizes, std::vector<std::string>* colnames);
+	void update_data(std::vector<chisel_sample_row>* data, bool force_selection_change = false);
 	void render(bool data_changed);
-	sysdig_table_action handle_input(int ch);
+	chisel_table_action handle_input(int ch);
 	void set_x_start(uint32_t x)
 	{
 		m_table_x_start = x;
@@ -45,9 +45,9 @@ public:
 	void recreate_win(int h);
 	void update_rowkey(int32_t row);
 	void goto_row(int32_t row);
-	bool get_position(OUT int32_t* pos, OUT int32_t* totlines, OUT float* percent, OUT bool* truncated);
+	bool get_position(int32_t* pos, int32_t* totlines, float* percent, bool* truncated);
 	void follow_end();
-	string get_field_val(string fldname);
+	std::string get_field_val(std::string fldname);
 	uint32_t get_data_size()
 	{
 		if(m_table != NULL)
@@ -60,31 +60,31 @@ public:
 		}
 	}
 
-	sinsp_table_field_storage m_last_key;
+	chisel_table_field_storage m_last_key;
 	bool m_drilled_up;
 	bool m_selection_changed;
 	MEVENT m_last_mevent;
 	
 private:
 	alignment get_field_alignment(ppm_param_type type);
-	void print_error(string wstr);
+	void print_error(std::string wstr);
 	void print_wait();
-	void print_line_centered(string line, int32_t off = 0);
+	void print_line_centered(std::string line, int32_t off = 0);
 
 	sinsp* m_inspector;
 	WINDOW* m_tblwin;
 	sinsp_cursesui* m_parent;
-	sinsp_table* m_table;
+	chisel_table* m_table;
 	int32_t m_table_x_start;
 	uint32_t m_table_y_start;
 	uint32_t m_scrolloff_x;
 	uint32_t m_colsizes[PT_MAX];
-	vector<curses_table_column_info> m_legend;
-	vector<sinsp_sample_row>* m_data;
+	std::vector<curses_table_column_info> m_legend;
+	std::vector<chisel_sample_row>* m_data;
 	sinsp_filter_check_reference* m_converter;
-	vector<uint32_t> m_column_startx;
+	std::vector<uint32_t> m_column_startx;
 	char alignbuf[64];
-	sinsp_table::tabletype m_type;
+	chisel_table::tabletype m_type;
 
 	friend class curses_table_sidemenu;
 	friend class sinsp_cursesui;        // for access to m_data in sinsp_cursesui::handle_input

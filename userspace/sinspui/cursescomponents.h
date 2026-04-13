@@ -20,21 +20,22 @@ limitations under the License.
 class search_caller_interface
 {
 public:
-	virtual bool on_search_key_pressed(string search_str) = 0;
+	virtual bool on_search_key_pressed(std::string search_str) = 0;
 	virtual bool on_search_next() = 0;
-	virtual string* get_last_search_string() = 0;
+	virtual std::string* get_last_search_string() = 0;
+	virtual ~search_caller_interface() = default;
 };
 
 class sidemenu_list_entry
 {
 public:
-	sidemenu_list_entry(string name, uint32_t id)
+	sidemenu_list_entry(std::string name, uint32_t id)
 	{
 		m_name = name;
 		m_id = id;
 	}
 
-	string m_name;
+	std::string m_name;
 	uint32_t m_id;
 };
 
@@ -56,7 +57,8 @@ public:
 	};
 	
 	spy_text_renderer(sinsp* inspector, 
-		sinsp_cursesui* parent, 
+		std::shared_ptr<sinsp_filter_check_list> filter_check_list,
+		sinsp_cursesui* parent,
 		int32_t viz_type, 
 		sysdig_output_type sotype, 
 		bool print_containers,
@@ -66,6 +68,7 @@ public:
 
 	sinsp_evt_formatter* m_formatter;
 	sinsp* m_inspector;
+	std::shared_ptr<sinsp_filter_check_list> m_filter_check_list;
 	int32_t m_viz_type;
 	uint64_t m_linecnt;
 };
@@ -86,10 +89,10 @@ public:
 	//
 	// Returns false if this chart doesn't support returning the current position
 	//
-	virtual bool get_position(OUT int32_t* pos, 
-		OUT int32_t* totlines, 
-		OUT float* percent,
-		OUT bool* truncated) = 0;
+	virtual bool get_position(int32_t* pos, 
+		int32_t* totlines, 
+		float* percent,
+		bool* truncated) = 0;
 };
 
 class curses_table_column_info
@@ -97,12 +100,13 @@ class curses_table_column_info
 public:	
 	curses_table_column_info()
 	{
+		m_size = -1;
 	}
 
 	//
 	// Use -1 as size for autosize
 	//
-	curses_table_column_info(IN filtercheck_field_info* info, int32_t size)
+	curses_table_column_info(filtercheck_field_info* info, int32_t size)
 	{
 		m_info = *info;
 		m_size = size;
@@ -111,7 +115,7 @@ public:
 //private:
 	filtercheck_field_info m_info;
 	int32_t m_size;
-	string m_name;
+	std::string m_name;
 
 	friend class curses_table;
 };
@@ -152,7 +156,7 @@ public:
 		uint32_t selct,
 		uint32_t width);
 	~curses_table_sidemenu();
-	void set_entries(vector<sidemenu_list_entry>* entries)
+	void set_entries(std::vector<sidemenu_list_entry>* entries)
 	{
 		m_entries = *entries;
 
@@ -161,18 +165,18 @@ public:
 			m_selct = 0;
 		}
 	}
-	void set_title(string title)
+	void set_title(std::string title)
 	{
 		m_title = title;
 	}
 	void render();
-	sysdig_table_action handle_input(int ch);
+	chisel_table_action handle_input(int ch);
 
 	WINDOW* m_win;
 	int32_t m_y_start;
 	sinsp_cursesui* m_parent;
-	vector<sidemenu_list_entry> m_entries;
-	string m_title;
+	std::vector<sidemenu_list_entry> m_entries;
+	std::string m_title;
 	MEVENT m_last_mevent;
 	sidemenu_type m_type;
 
@@ -184,22 +188,22 @@ class curses_textbox :
 public sinsp_chart, public search_caller_interface
 {
 public:
-	curses_textbox(sinsp* inspector, sinsp_cursesui* parent, int32_t viz_type, spy_text_renderer::sysdig_output_type sotype);
+	curses_textbox(sinsp* inspector, std::shared_ptr<sinsp_filter_check_list> filter_check_list, sinsp_cursesui* parent, int32_t viz_type, spy_text_renderer::sysdig_output_type sotype);
 	~curses_textbox();
 	void render();
-	void set_filter(string filter);
+	void set_filter(std::string filter);
 	void print_no_data();
 	void process_event(sinsp_evt* evt, int32_t next_res);
 	void render_header();
-	sysdig_table_action handle_input(int ch);
+	chisel_table_action handle_input(int ch);
 	void populate_sidemenu();
 	void reset();
-	bool get_position(OUT int32_t* pos, OUT int32_t* totlines, OUT float* percent, OUT bool* truncated);
-	string* get_last_search_string();
+	bool get_position(int32_t* pos, int32_t* totlines, float* percent, bool* truncated);
+	std::string* get_last_search_string();
 	int8_t get_offset(int32_t* x, int32_t* y); 
 	int8_t scroll_to(int32_t x, int32_t y);
 	void up();
-	bool on_search_key_pressed(string search_str);
+	bool on_search_key_pressed(std::string search_str);
 	bool on_search_next();
 
 	MEVENT m_last_mevent;
@@ -212,14 +216,15 @@ private:
 	ctext* m_ctext;
 	sinsp_cursesui* m_parent;
 	sinsp* m_inspector;
-	sinsp_filter* m_filter;
+	std::shared_ptr<sinsp_filter_check_list> m_filter_check_list;
+	std::unique_ptr<sinsp_filter> m_filter;
 	uint32_t n_prints;
 	bool m_paused;
 	curses_table_sidemenu* m_sidemenu;
-	vector<sidemenu_list_entry> m_entries;
+	std::vector<sidemenu_list_entry> m_entries;
 //	int32_t m_viz_type;
 //	sinsp_evt_formatter* m_formatter;
-	string m_last_search_string;
+	std::string m_last_search_string;
 	ctext_search* m_searcher;
 	bool m_has_searched;
 	bool m_search_type_is_goto;
@@ -232,7 +237,7 @@ class curses_mainhelp_page
 public:
 	curses_mainhelp_page(sinsp_cursesui* parent);
 	~curses_mainhelp_page();
-	sysdig_table_action handle_input(int ch);
+	chisel_table_action handle_input(int ch);
 	void render();
 
 private:
@@ -247,7 +252,7 @@ class curses_viewinfo_page
 public:
 	curses_viewinfo_page(sinsp_cursesui* parent, uint32_t viewnum, uint32_t starty, uint32_t startx, uint32_t h, uint32_t w);
 	~curses_viewinfo_page();
-	sysdig_table_action handle_input(int ch);
+	chisel_table_action handle_input(int ch);
 	void render();
 
 private:

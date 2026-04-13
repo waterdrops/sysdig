@@ -27,10 +27,15 @@ limitations under the License.
 #include <sys/stat.h>
 #include <assert.h>
 #include <algorithm>
+#include <atomic>
 
-#include <sinsp.h>
-#include "scap_open_exception.h"
-#include "sinsp_capture_interrupt_exception.h"
+#include <libsinsp/sinsp.h>
+#include <libsinsp/sinsp_cycledumper.h>
+#include <libsinsp/scap_open_exception.h>
+#include <libsinsp/utils.h>
+#include <libsinsp/plugin.h>
+#include <libsinsp/plugin_manager.h>
+#include <chisel/chisel_capture_interrupt_exception.h>
 #ifdef HAS_CAPTURE
 #ifndef WIN32
 #include "driver_config.h"
@@ -38,12 +43,17 @@ limitations under the License.
 #endif // HAS_CAPTURE
 #include "sysdig.h"
 #ifdef HAS_CHISELS
-#include "chisel.h"
-#include "chisel_utils.h"
-#include "chisel_fields_info.h"
+#include <chisel/chisel.h>
+#include <chisel/chisel_utils.h>
+#include <chisel/chisel_fields_info.h>
 #endif
-#include "fields_info.h"
-#include "utils.h"
+
+#include "filterchecks/sinsp_filtercheck_syslog.h"
+
+#include "utils/sinsp_opener.h"
+#include "utils/plugin_utils.h"
+#include "utils/supported_events.h"
+#include "utils/supported_fields.h"
 
 #ifdef _WIN32
 #include "win32/getopt.h"
@@ -54,10 +64,20 @@ limitations under the License.
 #include <termios.h>
 #endif
 
-static bool g_terminate = false;
+static constexpr const char* g_unknown_field_err = "nonexistent field ";
+
+static std::atomic<bool> g_terminate = false;
+static std::atomic<bool> g_terminating = false;
+static std::atomic<bool> g_plugin_input = false;
 #ifdef HAS_CHISELS
-vector<sinsp_chisel*> g_chisels;
+std::vector<sinsp_chisel*> g_chisels;
 #endif
+
+enum color_term_out {
+  COLOR = 0,
+  NO_COLOR,
+  FORCE_COLOR
+};
 
 static void usage();
 
@@ -66,7 +86,29 @@ static void usage();
 //
 static void signal_callback(int signal)
 {
-	g_terminate = true;
+	if(g_plugin_input)
+	{
+		//
+		// Input plugins can get stuck in next().
+		// When we are using one, check again in few seconds and force a quit
+		// if we are stuck.
+		//
+		if(g_terminate == true && g_terminating == false)
+		{
+			exit(0);
+		}
+		else
+		{
+			g_terminate = true;
+#ifndef _WIN32
+			alarm(3);
+#endif
+		}
+	}
+	else
+	{
+		g_terminate = true;
+	}
 }
 
 //
@@ -88,14 +130,22 @@ static void usage()
 "                    Enable live capture using the specified BPF probe instead of the kernel module.\n"
 "                    The BPF probe can also be specified via the environment variable\n"
 "                    SYSDIG_BPF_PROBE. If <bpf_probe> is left empty, sysdig will\n"
-"                    try to load one from the sysdig-probe-loader script.\n"
+"                    try to load one from the scap-driver-loader script.\n"
 #ifdef HAS_CHISELS
 " -c <chiselname> <chiselargs>, --chisel <chiselname> <chiselargs>\n"
 "                    run the specified chisel. If the chisel require arguments,\n"
 "                    they must be specified in the command line after the name.\n"
 " -cl, --list-chisels\n"
-"                    lists the available chisels. Looks for chisels in\n"
-"                    ./chisels, ~/.chisels and /usr/share/sysdig/chisels.\n"
+"                    lists the available chisels. Sysdig looks for chisels in the\n"
+"                    following directories: ./chisels, ~/.chisels, " SYSDIG_CHISELS_DIR ".\n"
+#endif
+#ifdef HAS_MODERN_BPF
+"  --cpus-for-each-buffer <cpus_num>\n"
+"                    Please note this config regards only the modern BPF probe.\n"
+"                    How many CPUs you want to assign to a single syscall buffer (ring buffer).\n"
+"                    By default, every syscall buffer is associated to 2 CPUs, so the mapping is\n"
+"                    1:2. The modern BPF probe allows you to choose different mappings, for\n"
+"                    example, 1:1 would mean a syscall buffer for each CPU.\n"
 #endif
 " -C <file_size>, --file-size=<file_size>\n"
 "                    Before writing an event, check whether the file is\n"
@@ -105,15 +155,6 @@ static void usage()
 "                    starting at 0 and continuing upward. The units of file_size\n"
 "                    are millions of bytes (10^6, not 2^20). Use the -W flag to\n"
 "                    determine how many files will be saved to disk.\n"
-#ifdef HAS_CAPTURE
-#ifndef MINIMAL_BUILD
-" --cri <path>       Path to CRI socket for container metadata\n"
-"                    Use the specified socket to fetch data from a CRI-compatible runtime\n"
-"\n"
-" --cri-timeout <timeout_ms>\n"
-"                    Wait at most <timeout_ms> milliseconds for response from CRI\n"
-#endif // MINIMAL_BUILD
-#endif // HAS_CAPTURE
 " -d, --displayflt   Make the given filter a display one\n"
 "                    Setting this option causes the events to be filtered\n"
 "                    after being parsed by the state system. Events are\n"
@@ -152,6 +193,14 @@ static void usage()
 "                    file. This could cause the file to contain unwanted or sensitive\n"
 "                    information. Using this flag causes the command line filter to\n"
 "                    be applied to the /proc dump as well.\n"
+" -g, --gvisor-config\n"
+"                    Parse events from gVisor using the specified configuration file.\n"
+"                    A sysdig-compatible configuration file can be generated with --gvisor-generate-config\n"
+"                    and can be used for both runsc and sysdig.\n"
+" --gvisor-generate-config [=<socket_path>(=/tmp/gvisor.sock)]\n"
+"                    Generate a configuration file that can be used for gVisor.\n"
+" --gvisor-root <gvisor_root>\n"
+"                    gVisor root directory for storage of container state. Equivalent to runsc --root flag.\n"
 " -G <num_seconds>, --seconds=<num_seconds>\n"
 "                    Rotates the dump file specified with the -w option every\n"
 "                    num_seconds seconds. Saved files will have the name specified\n"
@@ -160,6 +209,29 @@ static void usage()
 "                    If no data format is specified, this can be used with -W flag to\n"
 "                    create a ring buffer of events.\n"
 " -h, --help         Print this page\n"
+" -H <pluginname>[:<initconfig>], --plugin <pluginname>[:<initconfig>]\n"
+"                    Registers a plugin, using the passed init config if present.\n"
+"                    The format of initconf is controlled by the plugin, refer to each\n"
+"                    plugin's documentation to learn about it.\n"
+"                    A path can also be used as pluginname.\n"
+" -I <pluginname>[:<openparams>], --input <pluginname>[:<openparams>]\n"
+"                    Set a previously registered plugin as input,\n"
+"                    capturing events using it and passing the \n"
+"                    openparams string as open parameters.\n"
+"                    Only a single source plugin can be registered.\n"
+"                    If no plugins were registered, any found plugin in the directories\n"
+"                    specified by ;-separated environment variable SYSDIG_PLUGIN_DIR and\n"
+"                    in " SYSDIG_PLUGINS_DIR " is registered; then use the provided one as input source.\n"
+"                    The format of openparams is controlled by the plugin, refer to each\n"
+"                    plugin's documentation to learn about it.\n"
+"                    See https://falco.org/docs/plugins/plugin-api-reference/#ss-plugin-t-plugin-init-const-char-config-int32-t-rc-required-yes\n"
+"                    and https://falco.org/docs/plugins/plugin-api-reference/#ss-instance-t-plugin-open-ss-plugin-t-s-const-char-params-int32-t-rc-required-yes for more infos.\n"
+"                    The event sources available for capture vary depending on which \n"
+"                    plugins have been installed.\n"
+" -Il                Lists the loaded plugins. If no plugin has been registered through '-H',\n"
+"                    Sysdig looks for plugins in the directories \n"
+"                    specified by ;-separated environment variable SYSDIG_PLUGIN_DIR and\n"
+"                    in " SYSDIG_PLUGINS_DIR ".\n"
 #ifdef HAS_CHISELS
 " -i <chiselname>, --chisel-info <chiselname>\n"
 "                    Get a longer description and the arguments associated with\n"
@@ -167,28 +239,6 @@ static void usage()
 #endif
 " -j, --json         Emit output as json, data buffer encoding will depend from the\n"
 "                    print format selected.\n"
-#ifndef MINIMAL_BUILD
-" -k <url>, --k8s-api=<url>\n"
-"                    Enable Kubernetes support by connecting to the API server\n"
-"                    specified as argument. E.g. \"http://admin:password@127.0.0.1:8080\".\n"
-"                    The API server can also be specified via the environment variable\n"
-"                    SYSDIG_K8S_API.\n"
-" --node-name=<url>\n"
-"                    The node name is used as a filter when requesting metadata of pods\n"
-"                    to the API server; if empty, no filter is set\n"
-" -K <bt_file> | <cert_file>:<key_file[#password]>[:<ca_cert_file>], --k8s-api-cert=<bt_file> | <cert_file>:<key_file[#password]>[:<ca_cert_file>]\n"
-"                    Use the provided files names to authenticate user and (optionally) verify the K8S API\n"
-"                    server identity.\n"
-"                    Each entry must specify full (absolute, or relative to the current directory) path\n"
-"                    to the respective file.\n"
-"                    Private key password is optional (needed only if key is password protected).\n"
-"                    CA certificate is optional. For all files, only PEM file format is supported. \n"
-"                    Specifying CA certificate only is obsoleted - when single entry is provided \n"
-"                    for this option, it will be interpreted as the name of a file containing bearer token.\n"
-"                    Note that the format of this command-line option prohibits use of files whose names contain\n"
-"                    ':' or '#' characters in the file name.\n"
-"                    Option can also be provided via the environment variable SYSDIG_K8S_API_CERT.\n"
-#endif // MINIMAL_BUILD
 " -L, --list-events  List the events that the engine supports\n"
 " -l, --list         List the fields that can be used for filtering and output\n"
 "                    formatting. Use -lv to get additional information for each\n"
@@ -200,24 +250,47 @@ static void usage()
 "                    environment from /proc instead of truncating to the first 4KiB\n"
 "                    This may fail for short-lived processes and in that case\n"
 "                    the truncated environment is used instead.\n"
+" --log-level=<trace|debug|info|notice|warning|error|critical|fatal>\n"
+"                    Select log level. Useful together with --debug.\n"
 " --list-markdown    like -l, but produces markdown output\n"
 " -m <url[,marathon_url]>, --mesos-api=<url[,marathon_url]>\n"
-"                    Enable Mesos support by connecting to the API server\n"
+"                    [DEPRECATED] Enable Mesos support by connecting to the API server\n"
 "                    specified as argument. E.g. \"http://admin:password@127.0.0.1:5050\".\n"
 "                    Marathon url is optional and defaults to Mesos address, port 8080.\n"
 "                    The API servers can also be specified via the environment variable\n"
 "                    SYSDIG_MESOS_API.\n"
+#ifdef HAS_MODERN_BPF
+"--modern-bpf\n"
+"                    Enable live capture using the modern BPF probe instead of the kernel module.\n"
+#endif
 " -M <num_seconds>   Stop collecting after <num_seconds> reached.\n"
 " -n <num>, --numevents=<num>\n"
 "                    Stop capturing after <num> events\n"
+" --color <true|force|false> \n"
+"                    Set colors settings on terminal output.\n"
 " --page-faults      Capture user/kernel major/minor page faults\n"
+" --plugin-config-file\n"
+"                    Load the plugin configuration from a Falco-compatible yaml file.\n"
+"                    Do not mix this option with the '-H' or '-I' options: it is unsupported.\n"
+"                    See the plugin section in https://falco.org/docs/configuration/ for\n"
+"                    additional information\n"
 " -P, --progress     Print progress on stderr while processing trace files\n"
 " -p <output_format>, --print=<output_format>\n"
 "                    Specify the format to be used when printing the events.\n"
 "                    With -pc or -pcontainer will use a container-friendly format.\n"
-"                    With -pk or -pkubernetes will use a kubernetes-friendly format.\n"
-"                    With -pm or -pmesos will use a mesos-friendly format.\n"
+"                    [DEPRECATED] With -pk or -pkubernetes will use a kubernetes-friendly format.\n"
+"                    [DEPRECATED] With -pm or -pmesos will use a mesos-friendly format.\n"
 "                    See the examples section below for more info.\n"
+" --plugin-info <pluginname>\n"
+"                    Print info for a single plugin. This includes name, author,\n"
+"                    and all the descriptive info of the plugin. If present,\n"
+"                    this also prints the schema format for the init configuration\n"
+"                    and a list of suggested open parameters.\n"
+"                    All this info is controlled by the plugin, refer to each\n"
+"                    plugin's documentation to learn more about it.\n"
+"                    This can be combined with the -H option to load the plugin\n"
+"                    with a given configuration.\n"
+"                    A path can also be used as pluginname.\n"
 " -q, --quiet        Don't print events on the screen\n"
 "                    Useful when dumping to disk.\n"
 " -R                 Resolve port numbers to names.\n"
@@ -235,14 +308,6 @@ static void usage()
 "                    epoch, r for relative time from the beginning of the\n"
 "                    capture, d for delta between event enter and exit, and\n"
 "                    D for delta from the previous event.\n"
-" -T, --force-tracers-capture\n"
-"                    Tell the driver to make sure full buffers are captured from\n"
-"                    /dev/null, to make sure that tracers are completely\n"
-"                    captured. Note that sysdig will enable extended /dev/null\n"
-"                    capture by itself after detecting that tracers are written\n"
-"                    there, but that could result in the truncation of some\n"
-"                    tracers at the beginning of the capture. This option allows\n"
-"                    preventing that.\n"
 " --unbuffered       Turn off output buffering. This causes every single line\n"
 "                    emitted by sysdig to be flushed, which generates higher CPU\n"
 "                    usage but is useful when piping sysdig's output into another\n"
@@ -291,9 +356,9 @@ static void usage()
 "fields listed by 'sysdig -l'.\n\n"
 "Using -pc or -pcontainer, the default format will be changed to a container-friendly one:\n\n"
 "%%evt.num %%evt.outputtime %%evt.cpu %%container.name (%%container.id) %%proc.name (%%thread.tid:%%thread.vtid) %%evt.dir %%evt.type %%evt.info\n\n"
-"Using -pk or -pkubernetes, the default format will be changed to a kubernetes-friendly one:\n\n"
+"[DEPRECATED] Using -pk or -pkubernetes, the default format will be changed to a kubernetes-friendly one:\n\n"
 "%%evt.num %%evt.outputtime %%evt.cpu %%k8s.pod.name (%%container.id) %%proc.name (%%thread.tid:%%thread.vtid) %%evt.dir %%evt.type %%evt.info\n\n"
-"Using -pm or -pmesos, the default format will be changed to a mesos-friendly one:\n\n"
+"[DEPRECATED] Using -pm or -pmesos, the default format will be changed to a mesos-friendly one:\n\n"
 "%%evt.num %%evt.outputtime %%evt.cpu %%mesos.task.name (%%container.id) %%proc.name (%%thread.tid:%%thread.vtid) %%evt.dir %%evt.type %%evt.info\n\n"
 "Examples:\n\n"
 " Capture all the events from the live system and print them to screen\n"
@@ -306,21 +371,65 @@ static void usage()
 "   $ sysdig proc.name=cat and evt.type=open\n\n"
 " Print the name of the files opened by cat\n"
 "   $ sysdig -p\"%%evt.arg.name\" proc.name=cat and evt.type=open\n\n"
+" Register any found plugin and use dummy as input source passing to it open params\n"
+"   $ sysdig -I dummy:10'\n\n"
+" Load and register dummy source plugin passing to it init config and open params\n"
+"   $ sysdig -H dummy:'{\"jitter\":50}' -I dummy:10\n\n"
     );
 }
 
+double g_last_printed_progress_pct = 0;
+char g_prg_line_buf[512] = "";
+
+inline void clean_last_progress_line()
+{
+	uint32_t j;
+
+	for(j = 0; j < strlen(g_prg_line_buf); j++)
+	{
+		g_prg_line_buf[j] = ' ';
+	}
+	g_prg_line_buf[j] = 0;
+
+	fprintf(stderr, "\r%s", g_prg_line_buf);
+}
+
+inline void output_progress(sinsp* inspector, sinsp_evt* ev)
+{
+	if(ev == NULL || (ev->get_num() % 10000 == 0))
+	{
+		std::string ps;
+		double progress_pct = inspector->get_read_progress_with_str(&ps);
+
+		if(progress_pct - g_last_printed_progress_pct > 0.1)
+		{
+			clean_last_progress_line();
+			if(ps == "")
+			{
+				snprintf(g_prg_line_buf, sizeof(g_prg_line_buf), "%.2lf", progress_pct);
+			}
+			else
+			{
+				snprintf(g_prg_line_buf, sizeof(g_prg_line_buf), "%s", ps.c_str());
+			}
+
+			fprintf(stderr, "\r%s", g_prg_line_buf);
+			fflush(stderr);
+			g_last_printed_progress_pct = progress_pct;
+		}
+	}
+}
+
 void print_summary_table(sinsp* inspector,
-						 vector<summary_table_entry> &summary_table,
+						 std::vector<summary_table_entry> &summary_table,
 						 uint32_t nentries)
 {
-	sinsp_evttables* einfo = inspector->get_event_info_tables();
-
-	cout << "----------------------\n";
-	string tstr = string("Event");
+	std::cout << "----------------------\n";
+	std::string tstr = std::string("Event");
 	tstr.resize(16, ' ');
 	tstr += "#Calls\n";
-	cout << tstr;
-	cout << "----------------------\n";
+	std::cout << tstr;
+	std::cout << "----------------------\n";
 
 	sort(summary_table.begin(), summary_table.end(),
 		summary_table_entry_rsort_comparer());
@@ -336,7 +445,7 @@ void print_summary_table(sinsp* inspector,
 
 		if(e.m_is_unsupported_syscall)
 		{
-			tstr = einfo->m_syscall_info_table[e.m_id / 2].name;
+			tstr = scap_get_ppm_sc_name((ppm_sc_code) (e.m_id / 2));
 			tstr.resize(16, ' ');
 
 			printf("%s%s%" PRIu64 "\n",
@@ -346,7 +455,7 @@ void print_summary_table(sinsp* inspector,
 		}
 		else
 		{
-			tstr = einfo->m_event_info[e.m_id].name;
+			tstr = libsinsp::events::info((ppm_event_code) e.m_id)->name;
 			tstr.resize(16, ' ');
 
 			printf("%s%s%" PRIu64 "\n",
@@ -363,7 +472,7 @@ static void add_chisel_dirs(sinsp* inspector)
 	//
 	// Add the default chisel directory statically configured by the build system
 	//
-	chisel_add_dir(SYSDIG_INSTALLATION_DIR CHISELS_INSTALLATION_DIR, false);
+	chisel_add_dir(SYSDIG_CHISELS_DIR, false);
 
 	//
 	// Add the directories configured in the SYSDIG_CHISEL_DIR environment variable
@@ -372,7 +481,7 @@ static void add_chisel_dirs(sinsp* inspector)
 
 	if(s_user_cdirs != NULL)
 	{
-		vector<string> user_cdirs = sinsp_split(s_user_cdirs, ';');
+		std::vector<std::string> user_cdirs = sinsp_split(s_user_cdirs, ';');
 
 		for(uint32_t j = 0; j < user_cdirs.size(); j++)
 		{
@@ -402,17 +511,20 @@ static void initialize_chisels()
 //    - the next token starts with a '-'
 //    - the rest of the command line contains a valid filter
 //
-static void parse_chisel_args(sinsp_chisel* ch, sinsp* inspector, int optind, int argc, char **argv, int32_t* n_filterargs)
+static void parse_chisel_args(
+	sinsp_chisel* ch,
+	std::shared_ptr<sinsp_filter_factory> filter_factory,
+	int optind, int argc, char **argv, int32_t* n_filterargs)
 {
 	uint32_t nargs = ch->get_n_args();
 	uint32_t nreqargs = ch->get_n_required_args();
-	string args;
+	std::string args;
 
 	if(nargs != 0)
 	{
 		if(optind > (int32_t)argc)
 		{
-			throw sinsp_exception("invalid number of arguments for chisel " + string(optarg) + ", " + to_string((long long int)nargs) + " expected.");
+			throw sinsp_exception("invalid number of arguments for chisel " + std::string(optarg) + ", " + std::to_string((long long int)nargs) + " expected.");
 		}
 		else if(optind < (int32_t)argc)
 		{
@@ -427,7 +539,7 @@ static void parse_chisel_args(sinsp_chisel* ch, sinsp* inspector, int optind, in
 			{
 				if(args[0] != '-')
 				{
-					string testflt;
+					std::string testflt;
 
 					for(int32_t j = optind; j < argc; j++)
 					{
@@ -447,9 +559,8 @@ static void parse_chisel_args(sinsp_chisel* ch, sinsp* inspector, int optind, in
 					{
 						try
 						{
-							sinsp_filter_compiler compiler(inspector, testflt);
-							sinsp_filter* s = compiler.compile();
-							delete s;
+							sinsp_filter_compiler compiler(filter_factory, testflt);
+							std::unique_ptr<sinsp_filter> s = compiler.compile();
 						}
 						catch(...)
 						{
@@ -464,7 +575,7 @@ static void parse_chisel_args(sinsp_chisel* ch, sinsp* inspector, int optind, in
 		{
 			if(nreqargs != 0)
 			{
-				throw sinsp_exception("missing arguments for chisel " + string(optarg));
+				throw sinsp_exception("missing arguments for chisel " + std::string(optarg));
 			}
 		}
 	}
@@ -473,10 +584,9 @@ static void parse_chisel_args(sinsp_chisel* ch, sinsp* inspector, int optind, in
 static void free_chisels()
 {
 #ifdef HAS_CHISELS
-	for(vector<sinsp_chisel*>::iterator it = g_chisels.begin();
-		it != g_chisels.end(); ++it)
+	for(auto & g_chisel : g_chisels)
 	{
-		delete *it;
+		delete g_chisel;
 	}
 
 	g_chisels.clear();
@@ -486,9 +596,9 @@ static void free_chisels()
 static void chisels_on_capture_start()
 {
 #ifdef HAS_CHISELS
-	for(uint32_t j = 0; j < g_chisels.size(); j++)
+	for(auto & g_chisel : g_chisels)
 	{
-		g_chisels[j]->on_capture_start();
+		g_chisel->on_capture_start();
 	}
 #endif
 }
@@ -496,10 +606,9 @@ static void chisels_on_capture_start()
 static void chisels_on_capture_end()
 {
 #ifdef HAS_CHISELS
-	for(vector<sinsp_chisel*>::iterator it = g_chisels.begin();
-		it != g_chisels.end(); ++it)
+	for(auto & g_chisel : g_chisels)
 	{
-		(*it)->on_capture_end();
+		g_chisel->on_capture_end();
 	}
 #endif
 }
@@ -507,7 +616,7 @@ static void chisels_on_capture_end()
 static void chisels_do_timeout(sinsp_evt* ev)
 {
 #ifdef HAS_CHISELS
-	for(vector<sinsp_chisel*>::iterator it = g_chisels.begin();
+	for(std::vector<sinsp_chisel*>::iterator it = g_chisels.begin();
 		it != g_chisels.end(); ++it)
 	{
 		(*it)->do_timeout(ev);
@@ -515,20 +624,12 @@ static void chisels_do_timeout(sinsp_evt* ev)
 #endif
 }
 
-void handle_end_of_file(bool print_progress, bool reset_colors = false, sinsp_evt_formatter* formatter = NULL)
+void handle_end_of_file(sinsp* inspector, bool print_progress, bool reset_colors = false, sinsp_evt_formatter* formatter = NULL)
 {
-	string line;
-
-	// Notify the formatter that we are at the
-	// end of the capture in case it needs to
-	// write any terminating characters
-	if(formatter != NULL && formatter->on_capture_end(&line))
-	{
-		cout << line << endl;
-	}
+	std::string line;
 
 	if(reset_colors) {
-		cout << "\e[00m";
+		std::cout << "\e[00m";
 	}
 
 	//
@@ -537,7 +638,17 @@ void handle_end_of_file(bool print_progress, bool reset_colors = false, sinsp_ev
 	//
 	if(print_progress)
 	{
-		fprintf(stderr, "100.00\n");
+		clean_last_progress_line();
+		if(inspector == NULL)
+		{
+			fprintf(stderr, "\r100.00\n");
+		}
+		else
+		{
+			output_progress(inspector, NULL);
+			fprintf(stderr, "\n");
+		}
+
 		fflush(stderr);
 	}
 
@@ -553,9 +664,9 @@ void handle_end_of_file(bool print_progress, bool reset_colors = false, sinsp_ev
 	}
 }
 
-vector<string> split_nextrun_args(string na)
+std::vector<std::string> split_nextrun_args(std::string na)
 {
-	vector<string> res;
+	std::vector<std::string> res;
 	uint32_t laststart = 0;
 	uint32_t j;
 	bool inquote = false;
@@ -570,7 +681,7 @@ vector<string> split_nextrun_args(string na)
 		{
 			if(!inquote)
 			{
-				string arg = na.substr(laststart, j - laststart);
+				std::string arg = na.substr(laststart, j - laststart);
 				replace_in_place(arg, "\"", "");
 				res.push_back(arg);
 				laststart = j + 1;
@@ -587,29 +698,32 @@ vector<string> split_nextrun_args(string na)
 //
 // Event processing loop
 //
-captureinfo do_inspect(sinsp* inspector,
-	uint64_t cnt,
-	uint64_t duration_to_tot_ns,
-	bool quiet,
-	bool json,
-	bool do_flush,
-	bool reset_colors,
-	bool print_progress,
-	sinsp_filter* display_filter,
-	vector<summary_table_entry> &summary_table,
-	sinsp_evt_formatter* formatter)
+captureinfo do_inspect(sinsp *inspector, sinsp_cycledumper *dumper,
+                       uint64_t cnt, uint64_t duration_to_tot_ns, bool quiet,
+                       bool json, bool do_flush, bool reset_colors,
+                       bool print_progress,
+                       std::unique_ptr<sinsp_filter> display_filter,
+                       std::vector<summary_table_entry> &summary_table,
+                       sinsp_evt_formatter *syscall_evt_formatter,
+                       sinsp_evt_formatter *plugin_evt_formatter,
+                       std::shared_ptr<sinsp_syslog_decoder> syslog_decoder)
 {
 	captureinfo retval;
 	int32_t res;
 	sinsp_evt* ev;
-	string line;
-	double last_printed_progress_pct = 0;
+	std::string line;
 	uint64_t duration_start = 0;
 
 	if(json)
 	{
 		do_flush = true;
 	}
+
+	// This changes between syscall_evt_formatter and
+	// plugin_evt_formatter based on the event type.
+	sinsp_evt_formatter *formatter = syscall_evt_formatter;
+
+	inspector->start_capture();
 
 	//
 	// Loop through the events
@@ -622,27 +736,67 @@ captureinfo do_inspect(sinsp* inspector,
 			// End of capture, either because the user stopped it, or because
 			// we reached the event count specified with -n.
 			//
-			handle_end_of_file(print_progress, reset_colors, formatter);
+			if(g_terminate)
+			{
+				g_terminating = true;
+			}
+			handle_end_of_file(inspector, print_progress, reset_colors, formatter);
 			break;
 		}
+        syslog_decoder->reset();
 		res = inspector->next(&ev);
+        if (ev)
+        {
+            const uint16_t etype = ev->get_scap_evt()->type;
+            if (etype == PPME_SYSCALL_WRITE_X || etype == PPME_SYSCALL_WRITEV_X ||
+                etype == PPME_SYSCALL_PWRITE_X || etype == PPME_SYSCALL_PWRITEV_X ||
+                etype == PPME_SOCKET_SEND_X || etype == PPME_SOCKET_SENDTO_X ||
+                etype == PPME_SOCKET_SENDMSG_X || etype == PPME_SOCKET_SENDMMSG_X)
+            {
+                syslog_decoder->parse(ev);
+            }
+        }
 
-		if(res == SCAP_TIMEOUT)
+		if(dumper && ev && res != SCAP_EOF)
 		{
-			if(ev != NULL && ev->is_filtered_out())
+			dumper->dump(ev);
+		}
+		else if(res == SCAP_FAILURE && !inspector->is_live())
+		{
+			//
+			// scap file truncated.
+			//
+			// We fail gracefully:
+			// - all the expected output (except truncated
+			//   events) will be on stdout
+			// - the return code will be set as success
+			// - the inspector error will be on stderr
+			//
+			handle_end_of_file(inspector, print_progress, reset_colors, formatter);
+			std::cerr << inspector->getlasterr() << std::endl;
+			break;
+		}
+		if(res == SCAP_TIMEOUT || res == SCAP_FILTERED_EVENT)
+		{
+			if(res == SCAP_FILTERED_EVENT && ev != NULL && ev->is_filtered_out())
 			{
 				//
 				// The event has been dropped by the filtering system.
 				// Give the chisels a chance to run their timeout logic.
 				//
 				chisels_do_timeout(ev);
+
+				if(print_progress)
+				{
+					output_progress(inspector, ev);
+				}
 			}
 
 			continue;
 		}
 		else if(res == SCAP_EOF)
 		{
-			handle_end_of_file(print_progress, reset_colors, formatter);
+			handle_end_of_file(inspector, print_progress, reset_colors, formatter);
 			break;
 		}
 		else if(res != SCAP_SUCCESS)
@@ -651,19 +805,22 @@ captureinfo do_inspect(sinsp* inspector,
 			// Event read error.
 			// Notify the chisels that we're exiting, and then die with an error.
 			//
-			handle_end_of_file(print_progress, reset_colors, formatter);
-			cerr << "res = " << res << endl;
+			handle_end_of_file(inspector, print_progress, reset_colors, formatter);
+			std::cerr << "res = " << res << std::endl;
 			throw sinsp_exception(inspector->getlasterr().c_str());
 		}
+
+		formatter = (ev->get_type() == PPME_PLUGINEVENT_E ? plugin_evt_formatter : syscall_evt_formatter);
 
 		if (duration_start == 0)
 		{
 			duration_start = ev->get_ts();
 		} else if(duration_to_tot_ns > 0)
 		{
-			if(ev->get_ts() - duration_start >= duration_to_tot_ns)
+			if(ev->get_ts() > duration_start &&
+			   ev->get_ts() - duration_start >= duration_to_tot_ns)
 			{
-				handle_end_of_file(print_progress, reset_colors, formatter);
+				handle_end_of_file(inspector, print_progress, reset_colors, formatter);
 				break;
 			}
 		}
@@ -671,17 +828,7 @@ captureinfo do_inspect(sinsp* inspector,
 
 		if(print_progress)
 		{
-			if(ev->get_num() % 10000 == 0)
-			{
-				double progress_pct = inspector->get_read_progress();
-
-				if(progress_pct - last_printed_progress_pct > 0.1)
-				{
-					fprintf(stderr, "%.2lf\n", progress_pct);
-					fflush(stderr);
-					last_printed_progress_pct = progress_pct;
-				}
-			}
+			output_progress(inspector, ev);
 		}
 
 		//
@@ -690,9 +837,9 @@ captureinfo do_inspect(sinsp* inspector,
 #ifdef HAS_CHISELS
 		if(!g_chisels.empty())
 		{
-			for(vector<sinsp_chisel*>::iterator it = g_chisels.begin(); it != g_chisels.end(); ++it)
+			for(const auto& chisel : g_chisels)
 			{
-				if((*it)->run(ev) == false)
+				if(chisel->run(ev) == false)
 				{
 					continue;
 				}
@@ -710,14 +857,14 @@ captureinfo do_inspect(sinsp* inspector,
 
 				if(etype == PPME_GENERIC_E)
 				{
-					sinsp_evt_param *parinfo = ev->get_param(0);
-					uint16_t id = *(int16_t *)parinfo->m_val;
+					const sinsp_evt_param *parinfo = ev->get_param(0);
+					uint16_t id = *(int16_t *)parinfo->data();
 					summary_table[PPM_EVENT_MAX + id * 2].m_ncalls++;
 				}
 				else if(etype == PPME_GENERIC_X)
 				{
-					sinsp_evt_param *parinfo = ev->get_param(0);
-					uint16_t id = *(int16_t *)parinfo->m_val;
+					const sinsp_evt_param *parinfo = ev->get_param(0);
+					uint16_t id = *(int16_t *)parinfo->data();
 					summary_table[PPM_EVENT_MAX + id * 2 + 1].m_ncalls++;
 				}
 				else
@@ -741,29 +888,26 @@ captureinfo do_inspect(sinsp* inspector,
 				continue;
 			}
 
+			if(display_filter.get() && !display_filter->run(ev))
+			{
+				continue;
+			}
+
+			//
+			// Output the line
+			//
 			if(formatter->tostring(ev, &line))
 			{
-				//
-				// Output the line
-				//
-				if(display_filter)
-				{
-					if(!display_filter->run(ev))
-					{
-						continue;
-					}
-				}
-
-				cout << line << endl;
+				std::cout << line << std::endl;
 			}
 		}
 
 		if(do_flush)
 		{
-			cout << flush;
+			std::cout << std::flush;
 		}
 	}
-
+	inspector->stop_capture();
 	return retval;
 }
 
@@ -797,6 +941,15 @@ void disable_tty_echo() {
 }
 #endif
 
+static inline bool stdout_supports_color()
+{
+#ifdef _WIN32
+    return false;
+#else
+    return isatty(fileno(stdout));
+#endif
+}
+
 std::string escape_output_format(const std::string& s)
 {
     std::stringstream  ss{""};
@@ -829,9 +982,10 @@ std::string escape_output_format(const std::string& s)
 sysdig_init_res sysdig_init(int argc, char **argv)
 {
 	sysdig_init_res res;
-	sinsp* inspector = NULL;
-	vector<string> infiles;
-	string outfile;
+	std::unique_ptr<sinsp> inspector;
+	std::unique_ptr<sinsp_cycledumper> dumper;
+	std::vector<std::string> infiles;
+	std::string outfile;
 	int op;
 	uint64_t cnt = -1;
 	bool quiet = false;
@@ -839,14 +993,15 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 	bool verbose = false;
 	bool list_flds = false;
 	bool list_flds_markdown = false;
-	bool print_progress = false;
+	std::string list_flds_source = "";
 	bool compress = false;
 	sinsp_evt::param_fmt event_buffer_format = sinsp_evt::PF_NORMAL;
-	sinsp_filter* display_filter = NULL;
+	std::unique_ptr<sinsp_filter> display_filter;
 	double duration = 1;
 	int duration_to_tot = 0;
 	captureinfo cinfo;
-	string output_format;
+	std::string output_format;
+	std::string output_format_plugin;
 	uint32_t snaplen = 0;
 	int long_index = 0;
 	int32_t n_filterargs = 0;
@@ -854,23 +1009,18 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 	bool unbuf_flag = false;
 	bool reset_colors = false;
 	bool filter_proclist_flag = false;
-	string cname;
-	vector<summary_table_entry> summary_table;
-#ifndef MINIMAL_BUILD
-	string* k8s_api = 0;
-	string* node_name = 0;
-	string* k8s_api_cert = 0;
-	string* mesos_api = 0;
-#endif // MINIMAL_BUILD
-	bool force_tracers_capture = false;
-	bool page_faults = false;
-	bool bpf = false;
-	string bpf_probe;
+	std::string cname;
+	std::vector<summary_table_entry> summary_table;
 	std::set<std::string> suppress_comms;
-#ifdef HAS_CAPTURE
-	string cri_socket_path;
-#endif
-	bool udig = false;
+	plugin_utils plugins;
+	bool list_plugins = false;
+	std::string plugin_config_file = "";
+	sinsp_opener opener;
+	std::unique_ptr<filter_check_list> filter_list;
+	std::shared_ptr<sinsp_filter_factory> filter_factory;
+	color_term_out color_flag = COLOR;
+	bool user_defined_format = false;
+    std::shared_ptr<sinsp_syslog_decoder> syslog_decoder = std::make_shared<sinsp_syslog_decoder>();
 
 	// These variables are for the cycle_writer engine
 	int duration_seconds = 0;
@@ -887,9 +1037,8 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		{"chisel", required_argument, 0, 'c' },
 		{"list-chisels", no_argument, 0, 0 },
 #endif
-#ifdef HAS_CAPTURE
-		{"cri", required_argument, 0, 0 },
-		{"cri-timeout", required_argument, 0, 0 },
+#ifdef HAS_MODERN_BPF
+		{"cpus-for-each-buffer", required_argument, 0, 0 },
 #endif
 		{"displayflt", no_argument, 0, 'd' },
 		{"debug", no_argument, 0, 'D'},
@@ -897,28 +1046,31 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		{"event-limit", required_argument, 0, 'e'},
 		{"fatfile", no_argument, 0, 'F'},
 		{"filter-proclist", no_argument, 0, 0 },
+		{"gvisor-config", required_argument, 0, 'g'},
+		{"gvisor-generate-config", optional_argument, 0, 0},
+		{"gvisor-root", required_argument, 0, 0},
 		{"seconds", required_argument, 0, 'G' },
 		{"help", no_argument, 0, 'h' },
+		{"input", required_argument, 0, 'I' },
 #ifdef HAS_CHISELS
 		{"chisel-info", required_argument, 0, 'i' },
 #endif
 		{"file-size", required_argument, 0, 'C' },
 		{"json", no_argument, 0, 'j' },
-#ifndef MINIMAL_BUILD
-		{"k8s-api", required_argument, 0, 'k'},
-		{"node-name", required_argument, 0, 'N'},
-		{"k8s-api-cert", required_argument, 0, 'K' },
-#endif // MINIMAL_BUILD
 		{"large-environment", no_argument, 0, 0 },
-		{"list", no_argument, 0, 'l' },
+		{"list", optional_argument, 0, 'l' },
 		{"list-events", no_argument, 0, 'L' },
-		{"list-markdown", no_argument, 0, 0 },
+		{"list-markdown", optional_argument, 0, 0 },
 		{"libs-version", no_argument, 0, 0},
-#ifndef MINIMAL_BUILD
-		{"mesos-api", required_argument, 0, 'm'},
-#endif // MINIMAL_BUILD
+		{"log-level", required_argument, 0, 0 },
+#ifdef HAS_MODERN_BPF
+		{"modern-bpf", no_argument, 0, 0 },
+#endif
 		{"numevents", required_argument, 0, 'n' },
 		{"page-faults", no_argument, 0, 0 },
+		{"plugin", required_argument, 0, 'H' },
+		{"plugin-config-file", required_argument, 0, 0},
+		{"plugin-info", required_argument, 0, 0 },
 		{"progress", required_argument, 0, 'P' },
 		{"print", required_argument, 0, 'p' },
 		{"quiet", no_argument, 0, 'q' },
@@ -927,9 +1079,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		{"snaplen", required_argument, 0, 's' },
 		{"summary", no_argument, 0, 'S' },
 		{"suppress-comm", required_argument, 0, 'U' },
-		{"udig", required_argument, 0, 'u' },
 		{"timetype", required_argument, 0, 't' },
-		{"force-tracers-capture", required_argument, 0, 'T'},
 		{"unbuffered", no_argument, 0, 0 },
 		{"verbose", no_argument, 0, 'v' },
 		{"version", no_argument, 0, 0 },
@@ -938,37 +1088,36 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		{"print-hex", no_argument, 0, 'x'},
 		{"print-hex-ascii", no_argument, 0, 'X'},
 		{"compress", no_argument, 0, 'z' },
+		{"color", required_argument, 0, 0 },
 		{0, 0, 0, 0}
 	};
 
-	if (isatty(STDIN_FILENO))
-	{
-		output_format = "*%evt.num %evt.outputtime %evt.cpu \e[01;32m%proc.name\e[00m (\e[01;36m%proc.pid\e[00m.%thread.tid) %evt.dir \e[01;34m%evt.type\e[00m %evt.info";
-	} else
-	{
-		output_format = "*%evt.num %evt.outputtime %evt.cpu %proc.name (%thread.tid) %evt.dir %evt.type %evt.info";
-	}
-
 	try
 	{
-		inspector = new sinsp();
+		inspector.reset(new sinsp());
 		inspector->set_hostname_and_port_resolution_mode(false);
 
+		filter_list.reset(new sinsp_filter_check_list());
+        filter_list->add_filter_check(std::make_unique<sinsp_filter_check_syslog>(syslog_decoder));
+		filter_factory.reset(new sinsp_filter_factory(inspector.get(), *filter_list.get()));
+
 #ifdef HAS_CHISELS
-		add_chisel_dirs(inspector);
+		add_chisel_dirs(inspector.get());
 #endif
+		plugins.add_directory(SYSDIG_PLUGINS_DIR);
+		plugins.read_plugins_from_dirs(inspector.get());
+
+		// Load container plugin (if available)
+		plugins.load_container_plugin_if_available(inspector.get());
 
 		//
 		// Parse the args
 		//
-		while((op = getopt_long(argc, argv,
-                                        "AbB::c:"
-                                        "C:"
-                                        "dDEe:F"
-                                        "G:"
-                                        "hi:jk:K:lLm:M:n:Pp:qRr:Ss:t:TU:uv"
-                                        "W:"
-                                        "w:xXz", long_options, &long_index)) != -1)
+		while (
+			(op = getopt_long(argc, argv,
+								"AbB::c:C:dDEe:Fg:G:"
+								"hH:I:i:jlLm:M:n:Pp:qRr:Ss:t:U:vW:w:xXz",
+								long_options, &long_index)) != -1)
 		{
 			switch(op)
 			{
@@ -976,7 +1125,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				if(event_buffer_format != sinsp_evt::PF_NORMAL)
 				{
 					fprintf(stderr, "you cannot specify more than one output format\n");
-					delete inspector;
 					return sysdig_init_res(EXIT_SUCCESS);
 				}
 
@@ -986,7 +1134,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				if(event_buffer_format != sinsp_evt::PF_NORMAL)
 				{
 					fprintf(stderr, "you cannot specify more than one output format\n");
-					delete inspector;
 					return sysdig_init_res(EXIT_SUCCESS);
 				}
 
@@ -994,28 +1141,40 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				break;
 			case 'B':
 			{
-				bpf = true;
+				opener.bpf.enabled = true;
 				if(optarg)
 				{
-					bpf_probe = optarg;
+					opener.bpf.probe = optarg;
 				}
 				break;
 			}
 #ifdef HAS_CHISELS
 			case 'c':
 				{
-					string chisel = optarg;
+					std::string chisel = optarg;
 					if(chisel == "l")
 					{
-						vector<chisel_desc> chlist;
+						std::vector<chisel_desc> chlist;
 						sinsp_chisel::get_chisel_list(&chlist);
 						list_chisels(&chlist, true);
-						delete inspector;
 						return sysdig_init_res(EXIT_SUCCESS);
 					}
 
-					sinsp_chisel* ch = new sinsp_chisel(inspector, chisel);
-					parse_chisel_args(ch, inspector, optind, argc, argv, &n_filterargs);
+					// TODO(therealbobo): add plugins filterchecks
+					auto filter_list = std::make_shared<sinsp_filter_check_list>();
+                    filter_list->add_filter_check(std::make_unique<sinsp_filter_check_syslog>(syslog_decoder));
+
+					for (auto plugin : inspector->m_plugin_manager->plugins())
+					{
+						if (plugin->caps() & CAP_EXTRACTION)
+						{
+							// todo(therealbobo): manage field name conflicts
+							filter_list->add_filter_check(sinsp_plugin::new_filtercheck(plugin));
+						}
+					}
+					auto tmp_filter_factory = std::make_shared<sinsp_filter_factory>(inspector.get(), *filter_list.get());
+					sinsp_chisel* ch = new sinsp_chisel(inspector.get(), chisel, filter_list);
+					parse_chisel_args(ch, tmp_filter_factory, optind, argc, argv, &n_filterargs);
 					g_chisels.push_back(ch);
 				}
 #endif
@@ -1026,7 +1185,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				rollover_mb = atoi(optarg);
 				if(rollover_mb <= 0)
 				{
-					throw sinsp_exception(string("invalid file size") + optarg);
+					throw sinsp_exception(std::string("invalid file size") + optarg);
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
@@ -1043,7 +1202,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				event_limit = strtoul(optarg, NULL, 0);
 				if(event_limit <= 0)
 				{
-					throw sinsp_exception(string("invalid parameter 'number of events' ") + optarg);
+					throw sinsp_exception(std::string("invalid parameter 'number of events' ") + optarg);
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
@@ -1052,22 +1211,67 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				inspector->set_fatfile_dump_mode(true);
 				break;
 			// Number of seconds between roll-over
+			case 'g':
+				opener.gvisor.enabled = true;
+				if(optarg)
+				{
+					opener.gvisor.config = optarg;
+				}
+				break;
 			case 'G':
 				duration_seconds = atoi(optarg);
 				if(duration_seconds <= 0)
 				{
-					throw sinsp_exception(string("invalid duration") + optarg);
+					throw sinsp_exception(std::string("invalid duration") + optarg);
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
 				break;
+			case 'H':
+				{
+					std::string pluginname = optarg;
+					size_t cpos = pluginname.find(':');
+					std::string pgname = pluginname;
+					std::string pginitconf;
+					// Extract init config from string if present
+					if(cpos != std::string::npos)
+					{
+						pgname = pluginname.substr(0, cpos);
+						pginitconf = pluginname.substr(cpos + 1);
+					}
+					plugins.load_plugin(inspector.get(), pgname);
+					plugins.config_plugin(inspector.get(), pgname, pginitconf);
+					break;
+				}
+			case 'I':
+				{
+					std::string inputname = optarg;
+					if(inputname == "l")
+					{
+						list_plugins = true;
+						break;
+					}
 
+					size_t cpos = inputname.find(':');
+					std::string pgname = inputname;
+					std::string pgpars;
+					// Extract open params from string if present
+					if(cpos != std::string::npos)
+					{
+						pgname = inputname.substr(0, cpos);
+						pgpars = inputname.substr(cpos + 1);
+					}
+					plugins.select_input_plugin(inspector.get(), filter_list.get(), pgname, pgpars);
+					g_plugin_input = true;
+					opener.plugin.enabled = true;
+				}
+				break;
 #ifdef HAS_CHISELS
 			// --chisel-info and -i
 			case 'i':
 				{
 					cname = optarg;
-					vector<chisel_desc> chlist;
+					std::vector<chisel_desc> chlist;
 
 					sinsp_chisel::get_chisel_list(&chlist);
 
@@ -1076,7 +1280,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 						if(chlist[j].m_name == cname)
 						{
 							print_chisel_info(&chlist[j]);
-							delete inspector;
 							return sysdig_init_res(EXIT_SUCCESS);
 						}
 					}
@@ -1085,7 +1288,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				}
 				break;
 #endif
-
 			case 'd':
 				is_filter_display = true;
 				break;
@@ -1095,38 +1297,25 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				//
 				jflag = true;
 				break;
-#ifndef MINIMAL_BUILD
-			case 'k':
-				k8s_api = new string(optarg);
-				break;
-			case 'N':
-				node_name = new string(optarg);
-				break;
-			case 'K':
-				k8s_api_cert = new string(optarg);
-				break;
-#endif // MINIMAL_BUILD
 			case 'h':
 				usage();
-				delete inspector;
 				return sysdig_init_res(EXIT_SUCCESS);
 			case 'l':
 				list_flds = true;
+				if (optarg)
+				{
+					list_flds_source = optarg;
+				}
 				break;
 			case 'L':
-				list_events(inspector);
-				delete inspector;
+				// todo(jasondellaluce): support CLI for printing in markdown too
+				print_supported_events(inspector.get(), false);
 				return sysdig_init_res(EXIT_SUCCESS);
-#ifndef MINIMAL_BUILD
-			case 'm':
-				mesos_api = new string(optarg);
-				break;
-#endif // MINIMAL_BUILD
 			case 'M':
 				duration_to_tot = atoi(optarg);
 				if(duration_to_tot <= 0)
 				{
-					throw sinsp_exception(string("invalid duration") + optarg);
+					throw sinsp_exception(std::string("invalid duration") + optarg);
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
@@ -1143,56 +1332,40 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 
 				if(cnt <= 0)
 				{
-					throw sinsp_exception(string("invalid event count ") + optarg);
+					throw sinsp_exception(std::string("invalid event count ") + optarg);
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
 				break;
 			case 'P':
-				print_progress = true;
+				opener.options.print_progress = true;
 				break;
 			case 'p':
-				if(string(optarg) == "p")
+				if(std::string(optarg) == "p")
 				{
 					// -pp shows the default output format, useful if the user wants to tweak it.
 					printf("%s\n", output_format.c_str());
-					delete inspector;
 					return sysdig_init_res(EXIT_SUCCESS);
 				}
-				else if(string(optarg) == "c" || string(optarg) == "container")
+				else if(std::string(optarg) == "c" || std::string(optarg) == "container")
 				{
 					output_format = "*%evt.num %evt.outputtime %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info";
-
-					// This enables chisels to determine if they should print container information
-					if(inspector != NULL)
-					{
-						inspector->set_print_container_data(true);
-					}
+					output_format_plugin = "*%evt.num %evt.outputtime %evt.cpu %container.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info";
 				}
-				else if(string(optarg) == "k" || string(optarg) == "kubernetes")
+				else if(std::string(optarg) == "k" || std::string(optarg) == "kubernetes")
 				{
 					output_format = "*%evt.num %evt.outputtime %evt.cpu %k8s.pod.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info";
-
-					// This enables chisels to determine if they should print container information
-					if(inspector != NULL)
-					{
-						inspector->set_print_container_data(true);
-					}
 				}
-				else if(string(optarg) == "m" || string(optarg) == "mesos")
+				else if(std::string(optarg) == "m" || std::string(optarg) == "mesos")
 				{
 					output_format = "*%evt.num %evt.outputtime %evt.cpu %mesos.task.name (%container.id) %proc.name (%thread.tid:%thread.vtid) %evt.dir %evt.type %evt.info";
-
-					// This enables chisels to determine if they should print container information
-					if(inspector != NULL)
-					{
-						inspector->set_print_container_data(true);
-					}
 				}
 				else
 				{
 					output_format = optarg;
+					output_format_plugin = optarg;
 				}
+				user_defined_format = true;
 
 				break;
 			case 'q':
@@ -1202,11 +1375,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				inspector->set_hostname_and_port_resolution_mode(true);
 				break;
 			case 'r':
-				infiles.push_back(optarg);
-#ifndef MINIMAL_BUILD
-				k8s_api = new string();
-				mesos_api = new string();
-#endif // MINIMAL_BUILD
+				infiles.emplace_back(optarg);
 				break;
 			case 'S':
 				for(uint32_t j = 0; j < PPM_EVENT_MAX; j++)
@@ -1225,7 +1394,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				break;
 			case 't':
 				{
-					string tms(optarg);
+					std::string tms(optarg);
 
 					if(tms == "h" || tms == "a" || tms == "r" || tms == "d" || tms == "D")
 					{
@@ -1234,19 +1403,12 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 					else
 					{
 						fprintf(stderr, "invalid modifier for flag -t\n");
-						delete inspector;
 						return sysdig_init_res(EXIT_FAILURE);
 					}
 				}
 				break;
-			case 'T':
-				force_tracers_capture = true;
-				break;
 			case 'U':
-				suppress_comms.insert(string(optarg));
-				break;
-			case 'u':
-				udig = true;
+				suppress_comms.insert(std::string(optarg));
 				break;
 			case 'v':
 				verbose = true;
@@ -1261,7 +1423,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				file_limit = atoi(optarg);
 				if(file_limit <= 0)
 				{
-					throw sinsp_exception(string("invalid file limit") + optarg);
+					throw sinsp_exception(std::string("invalid file limit") + optarg);
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
@@ -1271,7 +1433,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				if(event_buffer_format != sinsp_evt::PF_NORMAL)
 				{
 					fprintf(stderr, "you cannot specify more than one output format\n");
-					delete inspector;
 					return sysdig_init_res(EXIT_FAILURE);
 				}
 
@@ -1281,7 +1442,6 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				if(event_buffer_format != sinsp_evt::PF_NORMAL)
 				{
 					fprintf(stderr, "you cannot specify more than one output format\n");
-					delete inspector;
 					return sysdig_init_res(EXIT_FAILURE);
 				}
 
@@ -1292,33 +1452,58 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				break;
 			case 0:
 				{
-					string optname = string(long_options[long_index].name);
+					std::string optname = std::string(long_options[long_index].name);
 					if (long_options[long_index].flag != 0) {
 						break;
 					}
 					if (optname == "version") {
 						printf("sysdig version %s\n", SYSDIG_VERSION);
-						delete inspector;
 						return sysdig_init_res(EXIT_SUCCESS);
 					}
 					else if (optname == "libs-version") {
-						printf("falcosecurity/libs version %s", FALCOSECURITY_LIBS_VERSION);
-						delete inspector;
+						printf("falcosecurity/libs version %s\n", FALCOSECURITY_LIBS_VERSION);
 						return sysdig_init_res(EXIT_SUCCESS);
+					}
+					else if (optname == "log-level") {
+						if (std::string(optarg) == "fatal") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_FATAL);
+						}
+						else if (std::string(optarg) == "critical") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_CRITICAL);
+						}
+						else if (std::string(optarg) == "error") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_ERROR);
+						}
+						else if (std::string(optarg) == "warning") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_WARNING);
+						}
+						else if (std::string(optarg) == "notice") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_NOTICE);
+						}
+						else if (std::string(optarg) == "info") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_INFO);
+						}
+						else if (std::string(optarg) == "debug") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_DEBUG);
+						}
+						else if (std::string(optarg) == "trace") {
+							inspector->set_min_log_severity(sinsp_logger::SEV_TRACE);
+						} else {
+							fprintf(stderr, "invalid log level %s\n", optarg);
+							return sysdig_init_res(EXIT_FAILURE);
+						}
+						libsinsp_logger()->add_stdout_log();
 					}
 					else if (optname == "list-chisels") {
-						vector<chisel_desc> chlist;
+						std::vector<chisel_desc> chlist;
 						sinsp_chisel::get_chisel_list(&chlist);
 						list_chisels(&chlist, true);
-						delete inspector;
 						return sysdig_init_res(EXIT_SUCCESS);
 					}
-#ifdef HAS_CAPTURE
-					else if (optname == "cri") {
-						cri_socket_path = optarg;
-					}
-					else if (optname == "cri-timeout") {
-						inspector->set_cri_timeout(sinsp_numparser::parsed64(optarg));
+#ifdef HAS_MODERN_BPF
+					else if(optname == "cpus-for-each-buffer")
+					{
+						opener.bpf.cpus_for_each_syscall_buffer = sinsp_numparser::parsed16(optarg);
 					}
 #endif
 					else if (optname == "unbuffered") {
@@ -1329,6 +1514,25 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 						filter_proclist_flag = true;
 					}
 
+					else if (optname == "gvisor-generate-config") {
+						std::string socket_path;
+						if (optarg)
+						{
+							socket_path = std::string(optarg);
+						}
+						std::string generated_config = inspector->generate_gvisor_config(socket_path);
+						printf("%s", generated_config.c_str());
+						return sysdig_init_res(EXIT_SUCCESS);
+					}
+
+					else if (optname == "gvisor_root")
+					{
+						if (optarg)
+						{
+							opener.gvisor.root = std::string(optarg);
+						}
+					}
+
 					else if (optname == "large-environment") {
 						inspector->set_large_envs(true);
 					}
@@ -1336,16 +1540,61 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 					else if (optname == "list-markdown") {
 						list_flds = true;
 						list_flds_markdown = true;
+						if (optarg)
+						{
+							list_flds_source = optarg;
+						}
+					}
+
+#ifdef HAS_MODERN_BPF
+					else if(optname == "modern-bpf")
+					{
+						opener.bpf.enabled = true;
+						opener.bpf.modern = true;
+					}
+#endif
+
+					else if(optname == "plugin-config-file") {
+						plugin_config_file = optarg;
+						plugins.load_plugins_from_conf_file(inspector.get(), filter_list.get(), plugin_config_file, false);
 					}
 
 					else if (optname == "page-faults") {
-						page_faults = true;
+						opener.options.page_faults = true;
+					}
+
+					else if (optname == "plugin-info")
+					{
+						auto name = std::string(optarg);
+						plugins.print_plugin_info(inspector.get(), filter_list.get(), name);
+						return sysdig_init_res(EXIT_SUCCESS);
+					}
+
+					else if (optname == "color")
+					{
+						auto color_state = std::string(optarg);
+						if (color_state == "true")
+						{
+							color_flag = COLOR;
+						}
+						else if (color_state == "force")
+						{
+							color_flag = FORCE_COLOR;
+						}
+						else if (color_state == "false")
+						{
+							color_flag = NO_COLOR;
+						}
+						else
+						{
+							fprintf(stderr, "invalid color mode for flag --color\n");
+							return sysdig_init_res(EXIT_FAILURE);
+						}
 					}
 				}
 				break;
-            // getopt_long : '?' for an ambiguous match or an extraneous parameter
+			// getopt_long : '?' for an ambiguous match or an extraneous parameter
 			case '?':
-				delete inspector;
 				return sysdig_init_res(EXIT_FAILURE);
 				break;
 			default:
@@ -1353,26 +1602,75 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			}
 		}
 
-#ifdef HAS_CAPTURE
-		if(!cri_socket_path.empty())
+		if(!user_defined_format)
 		{
-			inspector->set_cri_socket_path(cri_socket_path);
-		}
-#endif
-
-		if(!bpf)
-		{
-			const char *probe = scap_get_bpf_probe_from_env();
-			if(probe)
+			char* no_color_env = getenv("NO_COLOR");
+			if ((color_flag == FORCE_COLOR) ||
+				(stdout_supports_color() && no_color_env == nullptr && color_flag == COLOR))
 			{
-				bpf = true;
-				bpf_probe = probe;
+				output_format = R"(*%evt.num %evt.outputtime %evt.cpu \e[01;32m%proc.name\e[00m (\e[01;36m%proc.pid\e[00m.%thread.tid) %evt.dir \e[01;34m%evt.type\e[00m %evt.info)";
+				output_format_plugin = R"(*%evt.num %evt.datetime.s [\e[01;32m%evt.pluginname\e[00m] %evt.plugininfo)";
+			}
+			else
+			{
+				output_format = "*%evt.num %evt.outputtime %evt.cpu %proc.name (%thread.tid) %evt.dir %evt.type %evt.info";
+				output_format_plugin = "*%evt.num %evt.datetime.s [%evt.pluginname] %evt.plugininfo";
 			}
 		}
 
-		if(bpf)
+		// given the CLI options, we finish loading and initializing plugins.
+		// if no plugin has been specified as input with -I, we try to
+		// reload the config file (if present), and set the input plugin 
+		// depending on its content. In this way, -I has priority no matter
+		// what the CLI option order is, and the config file can also be used
+		// for the purposes of configuring plugins without defining the input.
+		if (!opener.plugin.enabled && !plugin_config_file.empty())
 		{
-			inspector->set_bpf_probe(bpf_probe);
+			// reload the file but by setting the plugin input, if present
+			plugins.load_plugins_from_conf_file(inspector.get(), filter_list.get(), plugin_config_file, true);
+
+			// set a flag if our event sourc input is a plugin-defined one
+			opener.plugin.enabled = plugins.has_input_plugin();
+			g_plugin_input = opener.plugin.enabled;
+		}
+
+		// all plugins have been loaded and configured so now we initialize them
+		plugins.init_loaded_plugins(inspector.get(), filter_list.get());
+
+		if (list_plugins)
+		{
+			plugins.print_plugin_info_list(inspector.get());
+			printf("More detailed info about individual plugins can be printed with the --plugin-info option:\n");
+			printf(" Detailed info about a single plugin\n");
+			printf("   $ sysdig --plugin-info=dummy\n\n");
+			printf(" Detailed info about a single plugin with a given configuration\n");
+			printf("   $ sysdig -H dummy:'{\"jitter\":50}' --plugin-info=dummy\n\n");
+			return sysdig_init_res(EXIT_SUCCESS);
+		}
+
+		if (opener.plugin.enabled)
+		{
+			opener.plugin.name = plugins.input_plugin_name();
+			opener.plugin.params = plugins.input_plugin_params();
+		}
+		
+		if(!opener.bpf.enabled)
+		{
+			const char *probe = getenv("SYSDIG_BPF_PROBE");
+			if (probe)
+			{
+				opener.bpf.enabled = true;
+				opener.bpf.probe = probe;
+			}
+		}
+
+		//
+		// If we are dumping events to file, enable progress printing so we can give
+		// feedback to the user
+		//
+		if(!outfile.empty() && (!infiles.empty() || opener.plugin.enabled))
+		{
+			opener.options.print_progress = true;
 		}
 
 		//
@@ -1410,31 +1708,35 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		//
 		if(list_flds)
 		{
-			if(verbose)
-			{
-				//
-				// -ll shows the fields verbosely, i.e. with more information
-				// like the type
-				//
-				list_fields(true, list_flds_markdown);
-			}
-			else
-			{
-				list_fields(false, list_flds_markdown);
-			}
-
+			print_supported_fields(inspector.get(), plugins, list_flds_source, verbose, list_flds_markdown);
 			res.m_res = EXIT_SUCCESS;
 			goto exit;
 		}
 
-		string filter;
+		for (auto &ch : g_chisels)
+		{
+			auto filter_list = std::make_shared<sinsp_filter_check_list>();
+            filter_list->add_filter_check(std::make_unique<sinsp_filter_check_syslog>(syslog_decoder));
+
+			for (auto plugin : inspector->m_plugin_manager->plugins())
+			{
+				if (plugin->caps() & CAP_EXTRACTION)
+				{
+					// todo(therealbobo): manage field name conflicts
+					filter_list->add_filter_check(sinsp_plugin::new_filtercheck(plugin));
+				}
+			}
+			auto tmp_filter_factory = std::make_shared<sinsp_filter_factory>(inspector.get(), *filter_list.get());
+			ch->set_filter_list(filter_list);
+		}
+
+		std::string filter;
 
 		//
 		// the filter is at the end of the command line
 		//
 		if(optind + n_filterargs < argc)
 		{
-#ifdef HAS_FILTERING
 			for(int32_t j = optind + n_filterargs; j < argc; j++)
 			{
 				filter += argv[j];
@@ -1446,14 +1748,22 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 
 			if(is_filter_display)
 			{
-				sinsp_filter_compiler compiler(inspector, filter);
-				display_filter = compiler.compile();
+				try
+				{
+					sinsp_filter_compiler compiler(filter_factory, filter);
+					display_filter = compiler.compile();
+				}
+				catch (sinsp_exception& e)
+				{
+					const char* errpos = strstr(e.what(), g_unknown_field_err);
+					if (errpos != NULL)
+					{
+						const char* field = errpos + strlen(g_unknown_field_err);
+						plugins.print_field_extraction_support(inspector.get(), field);
+					}
+					throw e;
+				}
 			}
-#else
-			fprintf(stderr, "filtering not compiled.\n");
-			res.m_res = EXIT_FAILURE;
-			goto exit;
-#endif
 		}
 
 		if(signal(SIGINT, signal_callback) == SIG_ERR)
@@ -1476,15 +1786,32 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			reset_colors = true;
 		}
 
+		output_format_plugin = escape_output_format(output_format_plugin);
+		if (output_format_plugin.find("\e") != std::string::npos)
+		{
+			reset_colors = true;
+		}
+
+#ifndef _WIN32
+		if(signal(SIGALRM, signal_callback) == SIG_ERR)
+		{
+			fprintf(stderr, "An error occurred while setting SIGALRM signal handler.\n");
+			res.m_res = EXIT_FAILURE;
+			goto exit;
+		}
+#endif
+
 		//
 		// Create the event formatter
 		//
-		sinsp_evt_formatter formatter(inspector, output_format);
+		sinsp_evt_formatter syscall_evt_formatter(inspector.get(), output_format, *filter_list.get());
+
+		sinsp_evt_formatter plugin_evt_formatter(inspector.get(), output_format_plugin, *filter_list.get());
 
 		//
 		// Set output buffers len
 		//
-		if(!verbose && g_chisels.size() == 0)
+		if(!verbose && g_chisels.empty())
 		{
 			inspector->set_max_evt_output_len(80);
 		}
@@ -1494,16 +1821,14 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 		//
 		if(filter_proclist_flag)
 		{
-			if(filter != "")
+			if(!filter.empty())
 			{
-				if(infiles.size() == 0)
+				if(infiles.empty())
 				{
 					fprintf(stderr, "--filter-proclist not supported with live captures.\n");
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
-
-				inspector->filter_proc_table_when_saving(true);
 			}
 			else
 			{
@@ -1513,25 +1838,37 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			}
 		}
 
-		for(uint32_t j = 0; j < infiles.size() || infiles.size() == 0; j++)
+		for(uint32_t j = 0; j < infiles.size() || infiles.empty(); j++)
 		{
-#ifdef HAS_FILTERING
-			if(filter.size() && !is_filter_display)
+			if(!filter.empty() && !is_filter_display)
 			{
-				inspector->set_filter(filter);
+				try
+				{
+					sinsp_filter_compiler compiler(filter_factory, filter);
+					std::unique_ptr<sinsp_filter> s = compiler.compile();
+					inspector->set_filter(std::move(s), filter);
+				}
+				catch (sinsp_exception& e)
+				{
+					const char* errpos = strstr(e.what(), g_unknown_field_err);
+					if (errpos != NULL)
+					{
+						const char* field = errpos + strlen(g_unknown_field_err);
+						plugins.print_field_extraction_support(inspector.get(), field);
+					}
+					throw e;
+				}
 			}
-#endif
 
 			// Suppress any comms specified via -U. We
 			// need to do this *before* opening the
 			// inspector, as that reads the process list.
 			for(auto &comm : suppress_comms)
 			{
-				if (!inspector->suppress_events_comm(comm.c_str()))
+				if (!inspector->suppress_events_comm(comm))
 				{
-					fprintf(stderr, "Could not add %s to the set of suppressed comms--did you specify more than %d values?\n",
-						comm.c_str(),
-						SCAP_MAX_SUPPRESSED_COMMS);
+					fprintf(stderr, "Could not add %s to the set of suppressed comms.\n",
+						comm.c_str());
 					res.m_res = EXIT_FAILURE;
 					goto exit;
 				}
@@ -1540,14 +1877,12 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			//
 			// Launch the capture
 			//
-			if(infiles.size() != 0)
+			if(!infiles.empty())
 			{
 				initialize_chisels();
-
-				//
-				// We have a file to open
-				//
-				inspector->open(infiles[j]);
+				opener.savefile.enabled = true;
+				opener.savefile.path = infiles[j];
+				opener.open(inspector.get());
 			}
 			else
 			{
@@ -1557,81 +1892,7 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				}
 
 				initialize_chisels();
-
-				//
-				// No file to open, this is a live capture
-				//
-#if defined(HAS_CAPTURE)
-				bool open_success = true;
-
-				if(print_progress)
-				{
-					fprintf(stderr, "the -P flag cannot be used with live captures.\n");
-					res.m_res = EXIT_FAILURE;
-					goto exit;
-				}
-
-				if(udig)
-				{
-					inspector->open_udig();
-				}
-				else
-				{
-					try
-					{
-						inspector->open("");
-					}
-					catch(const sinsp_exception& e)
-					{
-						open_success = false;
-					}
-				}
-				
-#ifndef _WIN32
-				//
-				// Starting the live capture failed, try to load the driver with
-				// modprobe.
-				//
-				if(!open_success)
-				{
-					open_success = true;
-
-					if(bpf)
-					{
-						if(bpf_probe.empty())
-						{
-							if(system("sysdig-probe-loader bpf"))
-							{
-								fprintf(stderr, "Unable to load the BPF probe\n");
-							}
-						}
-					}
-					else
-					{
-						if(system("modprobe " PROBE_NAME " > /dev/null 2> /dev/null"))
-						{
-							fprintf(stderr, "Unable to load the driver\n");
-						}
-					}
-
-					inspector->open("");
-				}
-#endif // _WIN32
-#else // HAS_CAPTURE
-				//
-				// Starting live capture
-				// If this fails on Windows and OSX, don't try with any driver
-				//
-				inspector->open("");
-#endif // HAS_CAPTURE
-
-				//
-				// Enable gathering the CPU from the kernel module
-				//
-				if(!udig)
-				{
-					inspector->set_get_procs_cpu_from_driver(true);
-				}
+				opener.open(inspector.get());
 			}
 
 			//
@@ -1642,25 +1903,11 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 				inspector->set_snaplen(snaplen);
 			}
 
-			//
-			// If required, tell the driver to enable tracers capture
-			//
-			if(force_tracers_capture)
-			{
-				inspector->enable_tracers_capture();
-			}
-
-			if(page_faults)
-			{
-				inspector->enable_page_faults();
-			}
-
 			duration = ((double)clock()) / CLOCKS_PER_SEC;
 
 			if(outfile != "")
 			{
-				inspector->setup_cycle_writer(outfile, rollover_mb, duration_seconds, file_limit, event_limit, compress);
-				inspector->autodump_next_file();
+				dumper = std::make_unique<sinsp_cycledumper>(inspector.get(), outfile, rollover_mb, duration_seconds, file_limit, event_limit, compress);
 			}
 
 			//
@@ -1668,81 +1915,20 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			//
 			chisels_on_capture_start();
 
-#ifndef MINIMAL_BUILD
-			//
-			// run k8s, if required
-			//
-			if(k8s_api)
-			{
-				if(!k8s_api_cert)
-				{
-					if(char* k8s_cert_env = getenv("SYSDIG_K8S_API_CERT"))
-					{
-						k8s_api_cert = new string(k8s_cert_env);
-					}
-				}
-				inspector->init_k8s_client(k8s_api, k8s_api_cert, node_name, verbose);
-				k8s_api = 0;
-				k8s_api_cert = 0;
-			}
-			else if(char* k8s_api_env = getenv("SYSDIG_K8S_API"))
-			{
-				if(k8s_api_env != NULL)
-				{
-					if(!k8s_api_cert)
-					{
-						if(char* k8s_cert_env = getenv("SYSDIG_K8S_API_CERT"))
-						{
-							k8s_api_cert = new string(k8s_cert_env);
-						}
-					}
-					k8s_api = new string(k8s_api_env);
-					inspector->init_k8s_client(k8s_api, k8s_api_cert, node_name, verbose);
-				}
-				else
-				{
-					delete k8s_api;
-					delete k8s_api_cert;
-				}
-				k8s_api = 0;
-				k8s_api_cert = 0;
-			}
-
-			//
-			// run mesos, if required
-			//
-			if(mesos_api)
-			{
-				inspector->init_mesos_client(mesos_api, verbose);
-			}
-			else if(char* mesos_api_env = getenv("SYSDIG_MESOS_API"))
-			{
-				if(mesos_api_env != NULL)
-				{
-					mesos_api = new string(mesos_api_env);
-					inspector->init_mesos_client(mesos_api, verbose);
-				}
-			}
-			delete mesos_api;
-			mesos_api = 0;
-#endif
 #ifndef _WIN32
 			// Sysdig does not accept user input during the inspect loop
 			// If the user stops the program with Ctrl-C disabling input would prevent the echoed ^C
 			// from messing up the output and possibly the shell line after program termination.
 			disable_tty_echo();
 #endif
-			cinfo = do_inspect(inspector,
-				cnt,
-				uint64_t(duration_to_tot*ONE_SECOND_IN_NS),
-				quiet,
-				jflag,
-				unbuf_flag,
-				reset_colors,
-				print_progress,
-				display_filter,
-				summary_table,
-				&formatter);
+                        cinfo = do_inspect(
+                            inspector.get(), dumper.get(), cnt,
+                            uint64_t(duration_to_tot * ONE_SECOND_IN_NS), quiet,
+                            jflag, unbuf_flag, reset_colors,
+                            opener.options.print_progress,
+                            std::move(display_filter), summary_table,
+                            &syscall_evt_formatter, &plugin_evt_formatter,
+                            syslog_decoder);
 
 			duration = ((double)clock()) / CLOCKS_PER_SEC - duration;
 
@@ -1763,30 +1949,36 @@ sysdig_init_res sysdig_init(int argc, char **argv)
 			}
 
 			//
-			// Done. Close the capture.
+			// Done. Close the inspector.
 			//
 			inspector->close();
 		}
 	}
-	catch(const sinsp_capture_interrupt_exception&)
+	catch(const chisel_capture_interrupt_exception&)
 	{
-		handle_end_of_file(print_progress, reset_colors);
+		handle_end_of_file(NULL, opener.options.print_progress, reset_colors);
 	}
 	catch(const scap_open_exception& e)
 	{
-		cerr << e.what() << endl;
-		handle_end_of_file(print_progress, reset_colors);
+		std::cerr << e.what() << std::endl;
+		handle_end_of_file(NULL, opener.options.print_progress, reset_colors);
 		res.m_res = e.scap_rc();
 	}
-	catch (const std::runtime_error& e) 
+	catch(const sinsp_exception& e)
 	{
-		cerr << e.what() << endl;
-		handle_end_of_file(print_progress, reset_colors);
+		std::cerr << e.what() << std::endl;
+		handle_end_of_file(NULL, opener.options.print_progress, reset_colors);
+		res.m_res = EXIT_FAILURE;
+	}
+	catch (const std::runtime_error& e)
+	{
+		std::cerr << e.what() << std::endl;
+		handle_end_of_file(NULL, opener.options.print_progress, reset_colors);
 		res.m_res = EXIT_FAILURE;
 	}
 	catch(...)
 	{
-		handle_end_of_file(print_progress, reset_colors);
+		handle_end_of_file(NULL, opener.options.print_progress, reset_colors);
 		res.m_res = EXIT_FAILURE;
 	}
 
@@ -1794,10 +1986,10 @@ exit:
 	//
 	// If any of the chisels is requesting another run,
 	//
-	for(vector<sinsp_chisel*>::iterator it = g_chisels.begin();
+	for(std::vector<sinsp_chisel*>::iterator it = g_chisels.begin();
 		it != g_chisels.end(); ++it)
 	{
-		string na;
+		std::string na;
 		if((*it)->get_nextrun_args(&na))
 		{
 			res.m_next_run_args = split_nextrun_args(na);
@@ -1809,23 +2001,13 @@ exit:
 	//
 	if(!summary_table.empty())
 	{
-		print_summary_table(inspector, summary_table, 100);
+		print_summary_table(inspector.get(), summary_table, 100);
 	}
 
 	//
 	// Free all the stuff that was allocated
 	//
 	free_chisels();
-
-	if(inspector)
-	{
-		delete inspector;
-	}
-
-	if(display_filter)
-	{
-		delete display_filter;
-	}
 
 	return res;
 }
@@ -1849,7 +2031,7 @@ int main(int argc, char **argv)
 		optopt = '?';
 
 		int newargc = (int)res.m_next_run_args.size() + 1;
-		vector<char*> newargv;
+		std::vector<char*> newargv;
 
 		newargv.push_back(argv[0]);
 
@@ -1863,6 +2045,5 @@ int main(int argc, char **argv)
 #ifdef _WIN32
 	_CrtDumpMemoryLeaks();
 #endif
-
 	return res.m_res;
 }

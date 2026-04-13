@@ -34,14 +34,14 @@ limitations under the License.
 #include <set>
 using namespace std;
 
-#include "sinsp.h"
-#include "filter.h"
-#include "filterchecks.h"
+#include <libsinsp/sinsp.h>
+#include <libsinsp/filter.h>
+#include <libsinsp/filterchecks.h>
 
 #ifndef NOCURSESUI
 
 #include <curses.h>
-#include "table.h"
+#include <chisel/chisel_table.h>
 #include "ctext.h"
 #include "cursescomponents.h"
 #include "cursestable.h"
@@ -123,7 +123,7 @@ inline void ansi_clearscreen()
 ///////////////////////////////////////////////////////////////////////////////
 // curses_spectro implementation
 ///////////////////////////////////////////////////////////////////////////////
-curses_spectro::curses_spectro(sinsp_cursesui* parent, sinsp* inspector, bool is_tracer)
+curses_spectro::curses_spectro(sinsp_cursesui* parent, sinsp* inspector)
 {
 	m_tblwin = NULL;
 	m_data = NULL;
@@ -147,7 +147,6 @@ curses_spectro::curses_spectro(sinsp_cursesui* parent, sinsp* inspector, bool is
 	m_prev_sel_y1 = -1;
 	m_prev_sel_y2 = -1;
 	m_scroll_paused = false;
-	m_is_tracer = is_tracer;
 	m_selecting = false;
 
 	//
@@ -201,7 +200,7 @@ curses_spectro::~curses_spectro()
 	delete m_converter;
 }
 
-void curses_spectro::configure(sinsp_table* table)
+void curses_spectro::configure(chisel_table* table)
 {
 	uint32_t j;
 
@@ -223,11 +222,11 @@ void curses_spectro::print_error(string wstr)
 
 	mvwprintw(m_tblwin, 
 		m_parent->m_screenh / 2,
-		m_parent->m_screenw / 2 - wstr.size() / 2, 
-		wstr.c_str());	
+		m_parent->m_screenw / 2 - wstr.size() / 2,
+		"%s", wstr.c_str());
 }
 
-void curses_spectro::update_data(vector<sinsp_sample_row>* data, bool force_selection_change)
+void curses_spectro::update_data(vector<chisel_sample_row>* data, bool force_selection_change)
 {
 	m_data = data;
 }
@@ -269,6 +268,7 @@ void curses_spectro::draw_axis()
 			uint64_t aval = (uint64_t)pow(10, curtime);
 
 			m_converter->set_val(PT_RELTIME, 
+				EPF_NONE,
 				(uint8_t*)&aval,
 				8,
 				0,
@@ -366,8 +366,8 @@ void curses_spectro::render(bool data_changed)
 		//
 		for(auto d : *m_data)
 		{
-			sinsp_table_field* key = &(d.m_values[0]); 
-			sinsp_table_field* data = &(d.m_values[1]); 
+			chisel_table_field* key = &(d.m_values[0]); 
+			chisel_table_field* data = &(d.m_values[1]); 
 			if(key->m_len != 8)
 			{
 				throw sinsp_exception("the key of a spectrogram view must be a number");
@@ -424,7 +424,7 @@ void curses_spectro::render(bool data_changed)
 //
 // Return false if the user wants us to exit
 //
-sysdig_table_action curses_spectro::handle_input(int ch)
+chisel_table_action curses_spectro::handle_input(int ch)
 {
 	if(m_data == NULL)
 	{
@@ -463,7 +463,7 @@ sysdig_table_action curses_spectro::handle_input(int ch)
 				{
 					if(m_last_mevent.bstate & BUTTON1_CLICKED)
 					{
-						g_logger.format("mouse clicked");
+						libsinsp_logger()->format("mouse clicked");
 
 						if(m_last_mevent.y == (int)m_h - 2)
 						{
@@ -511,39 +511,21 @@ sysdig_table_action curses_spectro::handle_input(int ch)
 									break;
 								}
 
-								string lat_fld_name;
-
-								if(m_is_tracer)
-								{
-									lat_fld_name = "span.duration";
-								}
-								else
-								{
-									lat_fld_name = "evt.latency";
-								}
-
-								m_selection_filter = 
+								m_selection_filter =
 									"(evt.rawtime>="  + to_string(start_row->m_ts - m_table->m_refresh_interval_ns) + 
 									" and evt.rawtime<=" + to_string(end_row->m_ts) + 
-									") and (" + lat_fld_name + ">=" + to_string(start_latency) + 
-									" and " + lat_fld_name + "<" + to_string(end_latency) + ")";
+									") and (evt.latency>=" + to_string(start_latency) +
+									" and evt.latency<" + to_string(end_latency) + ")";
 
-								g_logger.format("spectrogram drill down");
-								g_logger.format("filter: %s", m_selection_filter.c_str());
+								libsinsp_logger()->format("spectrogram drill down");
+								libsinsp_logger()->format("filter: %s", m_selection_filter.c_str());
 
 								m_selstart_x = -1;
 								m_selstart_y = -1;
 
 								ansi_reset_color();
 
-								if(m_is_tracer)
-								{
-									return STA_DRILLDOWN;
-								}
-								else
-								{
-									return STA_DIG;
-								}
+								return STA_DIG;
 							}
 						}
 					}

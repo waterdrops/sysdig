@@ -1232,7 +1232,7 @@ function build_output(captureDuration)
 			category = 'performance',
 			targetView = 'dig',
 			targetViewTitle = 'List of segfault events',
-			targetViewFilter = 'evt.type=signaldeliver and evt.arg.sig=SIGSEV',
+			targetViewFilter = 'evt.type=signaldeliver and evt.arg.sig=SIGSEGV',
 			drillDownKey = 'NONE',
 			data = gsummary.segfaultCount
 		}
